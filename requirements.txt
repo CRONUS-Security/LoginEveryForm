@@ -1,0 +1,20 @@
+# Browser Automation
+playwright
+
+# GUI Framework
+PySide6
+
+# Excel File Processing
+openpyxl
+
+# Captcha Recognition
+# ddddocr
+
+# Logging and Display
+rich
+
+# Image Processing (for captcha)
+Pillow
+
+# Async Support
+aiofiles

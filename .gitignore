@@ -1,0 +1,18 @@
+# Virtual Environment
+.venv/
+
+# IDE
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Screenshots
+screenshots/
+
+# Data files (may contain sensitive information)
+data/
+
+# Python cache files
+__pycache__/
