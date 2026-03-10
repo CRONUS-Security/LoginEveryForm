@@ -6,7 +6,7 @@ Main GUI Application using PySide6
 import sys
 import asyncio
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -122,6 +122,52 @@ class LoginWorker(QThread):
         self._is_running = False
 
 
+class CheckFormWorker(QThread):
+    """Worker thread: open browser, detect login form elements, emit CSS selectors to GUI."""
+
+    detected = Signal(object)  # Dict[str, Optional[str]]: username, password, captcha, submit
+    error = Signal(str)
+
+    def __init__(self, url: str, browser_type: str, headless: bool):
+        super().__init__()
+        self.url = url.strip()
+        self.browser_type = browser_type
+        self.headless = headless
+
+    def run(self):
+        try:
+            asyncio.run(self._async_run())
+        except Exception as e:
+            self.error.emit(str(e))
+
+    async def _async_run(self):
+        automation = None
+        try:
+            browser_type_enum = BrowserType[self.browser_type.upper()]
+            automation = BrowserAutomation(
+                browser_type=browser_type_enum,
+                headless=self.headless,
+                screenshot_dir=str(Config.SCREENSHOTS_DIR),
+            )
+            await automation.start()
+
+            page = await automation.context.new_page()
+            page.set_default_timeout(automation.timeout)
+            await page.goto(self.url, wait_until="domcontentloaded")
+            await page.wait_for_load_state("networkidle", timeout=automation.timeout)
+
+            selectors = await automation.detect_login_form(page)
+            await page.close()
+
+            self.detected.emit(selectors)
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+        finally:
+            if automation:
+                await automation.stop()
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
 
@@ -134,6 +180,7 @@ class MainWindow(QMainWindow):
         self.password_loader = PasswordLoader()
         self.credentials: List[Credential] = []
         self.worker: Optional[LoginWorker] = None
+        self.check_worker: Optional[CheckFormWorker] = None
         self.results: List[LoginResult] = []
 
         self.init_ui()
@@ -177,6 +224,7 @@ class MainWindow(QMainWindow):
         url_layout.addWidget(QLabel("URL:"))
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://example.com/login")
+        self.url_input.returnPressed.connect(self.check_form)  # Enter in URL field = Check (no credentials)
         url_layout.addWidget(self.url_input)
         url_group.setLayout(url_layout)
         layout.addWidget(url_group)
@@ -297,6 +345,12 @@ class MainWindow(QMainWindow):
 
         # Control Buttons
         control_layout = QHBoxLayout()
+        self.check_button = QPushButton("Check")
+        self.check_button.clicked.connect(self.check_form)
+        self.check_button.setStyleSheet("QPushButton { background-color: #2196F3; color: white; padding: 10px; font-weight: bold; }")
+        self.check_button.setToolTip("Only URL needed (no credentials). Open browser, detect login form controls, and fill CSS selectors above.")
+        control_layout.addWidget(self.check_button)
+
         self.start_button = QPushButton("Start Verification")
         self.start_button.clicked.connect(self.start_verification)
         self.start_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; padding: 10px; font-weight: bold; }")
@@ -412,15 +466,18 @@ class MainWindow(QMainWindow):
             self.log(f"Error: {str(e)}")
 
     def start_verification(self):
-        """Start verification process"""
-        # Validate inputs
+        """Start verification process (requires credentials loaded)."""
         url = self.url_input.text().strip()
         if not url:
             QMessageBox.warning(self, "Error", "Please enter the target URL")
             return
 
         if not self.credentials:
-            QMessageBox.warning(self, "Error", "Please load credentials first")
+            QMessageBox.warning(
+                self,
+                "Start Verification",
+                "Please load credentials first.\n\nTip: Use \"Check (URL only)\" to detect form fields without loading credentials.",
+            )
             return
 
         # Get selectors
@@ -470,6 +527,58 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.stop()
             self.log("Stopping verification...")
+
+    def check_form(self):
+        """Open browser, detect login form elements, and fill selector inputs. Requires only URL (no credentials)."""
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Error", "Please enter the target URL (no credentials required for Check).")
+            return
+
+        self.check_button.setEnabled(False)
+        self.statusBar().showMessage("Detecting login form...")
+        self.log("Check: Opening browser and detecting form elements...")
+
+        self.check_worker = CheckFormWorker(
+            url=url,
+            browser_type=self.browser_combo.currentText(),
+            headless=self.headless_check.isChecked(),
+        )
+        self.check_worker.detected.connect(self._on_check_detected)
+        self.check_worker.error.connect(self._on_check_error)
+        self.check_worker.finished.connect(self._on_check_finished)
+        self.check_worker.start()
+
+    def _on_check_detected(self, selectors: Dict[str, Any]):
+        """Fill GUI selector inputs with detected CSS expressions."""
+        username = selectors.get("username") or ""
+        password = selectors.get("password") or ""
+        captcha = selectors.get("captcha") or ""
+        submit = selectors.get("submit") or ""
+
+        self.username_selector_input.setText(username)
+        self.password_selector_input.setText(password)
+        self.captcha_selector_input.setText(captcha)
+        self.submit_selector_input.setText(submit)
+
+        self.log("Check: Detected selectors filled.")
+        self.log(f"  Username: {username or '(none)'}")
+        self.log(f"  Password: {password or '(none)'}")
+        self.log(f"  Captcha:  {captcha or '(none)'}")
+        self.log(f"  Submit:   {submit or '(none)'}")
+        self.statusBar().showMessage("Detection complete. Selectors filled.")
+
+    def _on_check_error(self, error_msg: str):
+        """Handle check worker error."""
+        self.log(f"Check error: {error_msg}")
+        QMessageBox.critical(self, "Check Failed", error_msg)
+        self.statusBar().showMessage("Check failed")
+
+    def _on_check_finished(self):
+        """Re-enable Check button when worker finishes."""
+        self.check_button.setEnabled(True)
+        if self.check_worker and self.check_worker.isFinished():
+            self.check_worker = None
 
     def update_progress(self, current: int, total: int, message: str):
         """Update progress"""
