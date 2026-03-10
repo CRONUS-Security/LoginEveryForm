@@ -372,59 +372,58 @@ class BrowserAutomation:
         try:
             current_url = page.url
 
-            # Check if URL changed (common success indicator)
-            if current_url != original_url and not any(err in current_url.lower() for err in ['error', 'login', 'signin']):
-                self.logger.debug(f"URL changed: {original_url} → {current_url}")
-                return True
-
-            # Check for custom success indicator
-            if success_indicator:
-                if success_indicator.startswith("http"):
-                    # URL pattern matching
-                    if success_indicator in current_url:
-                        return True
-                else:
-                    # CSS selector
-                    element = await page.query_selector(success_indicator)
-                    if element:
-                        return True
-
-            # Check for common error indicators
+            # 先检测页面上的失败提示（避免仅因 URL 变化误判为成功）
             error_patterns = [
-                "text=/错误|失败|error|failed|invalid|incorrect/i",
+                "text=/错误|失败|error|failed|invalid|incorrect|unable to login|cannot login|login failed|access denied/i",
                 ".error",
                 ".alert-error",
                 ".alert-danger",
                 "#error",
             ]
-
             for pattern in error_patterns:
                 element = await page.query_selector(pattern)
                 if element:
                     self.logger.debug(f"Error indicator found: {pattern}")
                     return False
 
-            # Check for common success indicators
+            # 再检查自定义成功条件
+            if success_indicator:
+                if success_indicator.startswith("http"):
+                    if success_indicator in current_url:
+                        return True
+                else:
+                    element = await page.query_selector(success_indicator)
+                    if element:
+                        return True
+
+            # URL 变化且不含“仍在登录/认证”的路径时才视为成功（含 #!/auth、/login、/signin 等不算成功）
+            url_lower = current_url.lower()
+            if current_url != original_url and not any(
+                err in url_lower for err in ["error", "login", "signin", "auth"]
+            ):
+                self.logger.debug(f"URL changed: {original_url} → {current_url}")
+                return True
+
+            # 常见成功元素
             success_patterns = [
                 "text=/欢迎|welcome|dashboard|home|profile/i",
                 ".user-menu",
                 ".profile",
                 "#dashboard",
             ]
-
             for pattern in success_patterns:
                 element = await page.query_selector(pattern)
                 if element:
                     self.logger.debug(f"Success indicator found: {pattern}")
                     return True
 
-            # If still on login page with username field present, likely failed
+            # 仍在登录页（有用户名框）视为失败
             username_field = await page.query_selector("input[type='text'], input[type='email']")
             if username_field:
                 self.logger.debug("Still on login page with username field present")
                 return False
 
-            # Default: if no clear error and URL changed, consider success
+            # 默认：无明确错误且 URL 变化才视为成功（auth 已在上面排除）
             return current_url != original_url
 
         except Exception as e:
