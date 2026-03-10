@@ -5,6 +5,7 @@ Main GUI Application using PySide6
 
 import sys
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -175,7 +176,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         Config.ensure_directories()
-        self.logger = init_logger(str(Config.LOGS_DIR))
+        log_level = getattr(logging, Config.LOG_LEVEL, logging.DEBUG)
+        self.logger = init_logger(str(Config.LOGS_DIR), log_level)
 
         self.password_loader = PasswordLoader()
         self.credentials: List[Credential] = []

@@ -45,14 +45,14 @@ class SecurityLogger:
         )
         file_handler.setFormatter(file_formatter)
 
-        # Rich console handler (formatted console output)
+        # Rich console handler (formatted console output) - 使用与 logger 相同的级别，便于在控制台看到 DEBUG
         console_handler = RichHandler(
             console=self.console,
             rich_tracebacks=True,
             tracebacks_show_locals=True,
             markup=True
         )
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(log_level)
 
         # Add handlers
         self.logger.addHandler(file_handler)
