@@ -248,6 +248,11 @@ class BrowserAutomation:
         screenshot_path = None
 
         try:
+            # 每次测试前清空 cookie 和 session，保证独立登录环境，窗口保持不关
+            if self.context:
+                await self.context.clear_cookies()
+                self.logger.debug("Cleared cookies and session state for this attempt")
+
             # Create new page
             page = await self.context.new_page()
             page.set_default_timeout(self.timeout)
