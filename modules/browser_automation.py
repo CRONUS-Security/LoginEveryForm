@@ -20,6 +20,7 @@ from playwright.async_api import (
 from .logger import get_logger
 from .captcha_solver import CaptchaSolver
 from .password_loader import Credential
+from .form_detection import detect_login_form, wait_for_login_form, get_captcha_image_patterns
 
 
 class LoginStatus(Enum):
@@ -143,201 +144,13 @@ class BrowserAutomation:
         except Exception as e:
             self.logger.error(f"Error stopping browser: {e}")
 
-    async def _get_login_container_scope(self, page: Page) -> str:
-        """
-        Find the best container scope for login fields: prefer <form> with password,
-        then role=form, then common class names. Returns empty string if none.
-        """
-        # Order: form tag first, then semantic role/classes
-        scopes = [
-            "form:has(input[type='password'])",
-            "[role='form']:has(input[type='password'])",
-            ".login-form:has(input[type='password'])",
-            ".login-box:has(input[type='password'])",
-            ".auth-form:has(input[type='password'])",
-            "#loginForm:has(input[type='password'])",
-            "[class*='login']:has(input[type='password'])",
-        ]
-        for scope in scopes:
-            try:
-                el = await page.query_selector(scope)
-                if el:
-                    return scope
-            except Exception:
-                continue
-        return ""
-
-    async def _query_in_scope(self, page: Page, scope: str, selector: str):
-        """Query element: if scope given, within scope (scope >> selector); else page.query_selector(selector)."""
-        try:
-            if scope:
-                full = f"{scope} >> {selector}"
-                return await page.query_selector(full)
-            return await page.query_selector(selector)
-        except Exception:
-            return None
-
     async def detect_login_form(self, page: Page) -> Dict[str, Optional[str]]:
         """
-        Automatically detect login form elements with form-scoped and attribute-based matching
-        to improve stability. Prefers: 1) elements inside a form that has a password field,
-        2) HTML5 autocomplete attributes, 3) specific name/id/placeholder in priority order.
+        自动检测登录表单控件（规则见 modules/form_detection/ 下各文件）。
         """
         self.logger.debug("Detecting login form elements (form-scoped + autocomplete priority)...")
-
-        selectors = {
-            "username": None,
-            "password": None,
-            "captcha": None,
-            "submit": None
-        }
-
-        try:
-            # Prefer form/container that contains password field to avoid matching search/nav bars
-            scope = await self._get_login_container_scope(page)
-
-            # ----- Password: high confidence (type=password is definitive) -----
-            password_patterns = [
-                "input[type='password']",
-                "input[autocomplete='current-password']",
-                "input[name*='password']",
-                "input[name*='passwd']",
-                "input[id*='password']",
-                "input[id*='passwd']",
-                "input[placeholder*='密码']",
-                "input[placeholder*='password']",
-            ]
-            for pattern in password_patterns:
-                el = await self._query_in_scope(page, scope, pattern)
-                if el:
-                    selectors["password"] = f"{scope} >> {pattern}" if scope else pattern
-                    self.logger.debug(f"Password field found: {selectors['password']}")
-                    break
-            if not selectors["password"]:
-                # Fallback: any password on page
-                for pattern in password_patterns:
-                    el = await page.query_selector(pattern)
-                    if el:
-                        selectors["password"] = pattern
-                        self.logger.debug(f"Password field (page fallback): {pattern}")
-                        break
-
-            # ----- Username: prefer autocomplete, then name/placeholder (avoid captcha-like) -----
-            username_patterns = [
-                "input[autocomplete='username']",
-                "input[autocomplete='email']",
-                "input[type='email']",
-                "input[name='username']",
-                "input[name='user']",
-                "input[name='account']",
-                "input[name='login']",
-                "input[name='email']",
-                "input[type='text'][name*='user']",
-                "input[type='text'][name*='login']",
-                "input[type='text'][name*='account']",
-                "input[id='username']",
-                "input[id='user']",
-                "input[id='account']",
-                "input[id='login']",
-                "input[type='text'][id*='user']",
-                "input[type='text'][id*='login']",
-                "input[type='text'][id*='account']",
-                "input[placeholder*='用户']",
-                "input[placeholder*='用户名']",
-                "input[placeholder*='账号']",
-                "input[placeholder*='邮箱']",
-                "input[placeholder*='手机']",
-                "input[placeholder*='username']",
-                "input[placeholder*='email']",
-                "input[placeholder*='account']",
-                # Exclude likely captcha: not name/id containing code/captcha/verify
-                "input[type='text']:not([name*='captcha']):not([name*='code']):not([name*='verify']):not([id*='captcha']):not([id*='code']):not([id*='verify'])",
-            ]
-            for pattern in username_patterns:
-                el = await self._query_in_scope(page, scope, pattern)
-                if el:
-                    selectors["username"] = f"{scope} >> {pattern}" if scope else pattern
-                    self.logger.debug(f"Username field found: {selectors['username']}")
-                    break
-            if not selectors["username"]:
-                for pattern in username_patterns:
-                    el = await page.query_selector(pattern)
-                    if el:
-                        selectors["username"] = pattern
-                        self.logger.debug(f"Username field (page fallback): {pattern}")
-                        break
-
-            # ----- Captcha: prefer explicit captcha/verify/验证码 to avoid "discount code" -----
-            captcha_patterns = [
-                "input[name*='captcha']",
-                "input[name*='verify']",
-                "input[id*='captcha']",
-                "input[id*='verify']",
-                "input[placeholder*='验证码']",
-                "input[placeholder*='captcha']",
-                "input[placeholder*='图形码']",
-                "input[placeholder*='安全码']",
-                "input[name*='code']",
-                "input[id*='code']",
-                "input[placeholder*='code']",
-            ]
-            for pattern in captcha_patterns:
-                el = await self._query_in_scope(page, scope, pattern)
-                if el:
-                    # Avoid treating main username as captcha: if same as username selector, skip
-                    if selectors["username"] and (pattern == selectors["username"] or (scope and selectors["username"] == f"{scope} >> {pattern}")):
-                        continue
-                    selectors["captcha"] = f"{scope} >> {pattern}" if scope else pattern
-                    self.logger.debug(f"Captcha field found: {selectors['captcha']}")
-                    break
-            if not selectors["captcha"]:
-                for pattern in captcha_patterns:
-                    el = await page.query_selector(pattern)
-                    if el:
-                        if selectors["username"] and pattern == selectors["username"]:
-                            continue
-                        selectors["captcha"] = pattern
-                        self.logger.debug(f"Captcha field (page fallback): {pattern}")
-                        break
-
-            # ----- Submit button -----
-            submit_patterns = [
-                "button[type='submit']",
-                "input[type='submit']",
-                "button:has-text('登录')",
-                "button:has-text('登錄')",
-                "button:has-text('登 录')",
-                "button:has-text('Login')",
-                "button:has-text('Sign in')",
-                "button:has-text('Sign In')",
-                "button[name*='login']",
-                "button[id*='login']",
-                "input[value*='登录']",
-                "input[value*='登 录']",
-                "input[value*='Login']",
-                "input[value*='Sign in']",
-                "a:has-text('登录')",
-                "a:has-text('Login')",
-            ]
-            for pattern in submit_patterns:
-                el = await self._query_in_scope(page, scope, pattern)
-                if el:
-                    selectors["submit"] = f"{scope} >> {pattern}" if scope else pattern
-                    self.logger.debug(f"Submit button found: {selectors['submit']}")
-                    break
-            if not selectors["submit"]:
-                for pattern in submit_patterns:
-                    el = await page.query_selector(pattern)
-                    if el:
-                        selectors["submit"] = pattern
-                        self.logger.debug(f"Submit button (page fallback): {pattern}")
-                        break
-
-            return selectors
-
-        except Exception as e:
-            self.logger.error(f"Error detecting login form: {e}")
-            return selectors
+        await wait_for_login_form(page, timeout_ms=5000)
+        return await detect_login_form(page, self.logger)
 
     async def get_captcha_image(self, page: Page, captcha_selector: Optional[str] = None) -> Optional[bytes]:
         """
@@ -351,19 +164,9 @@ class BrowserAutomation:
             Image bytes or None
         """
         try:
-            # Common captcha image selectors
+            # Common captcha image selectors (from form_detection/captcha_image.py)
             if not captcha_selector:
-                captcha_image_patterns = [
-                    "img[src*='captcha']",
-                    "img[src*='code']",
-                    "img[src*='verify']",
-                    "img[alt*='验证码']",
-                    "img[alt*='captcha']",
-                    "#captcha-image",
-                    ".captcha-image",
-                ]
-
-                for pattern in captcha_image_patterns:
+                for pattern in get_captcha_image_patterns():
                     captcha_element = await page.query_selector(pattern)
                     if captcha_element:
                         captcha_selector = pattern
