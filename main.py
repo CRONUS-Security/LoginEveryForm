@@ -154,7 +154,7 @@ class CheckFormWorker(QThread):
             page = await automation.context.new_page()
             page.set_default_timeout(automation.timeout)
             await page.goto(self.url, wait_until="domcontentloaded")
-            await page.wait_for_load_state("networkidle", timeout=automation.timeout)
+            await page.wait_for_load_state("load", timeout=automation.timeout)
 
             selectors = await automation.detect_login_form(page)
             await page.close()
