@@ -9,6 +9,7 @@ CAPTCHA_IMAGE_PATTERNS = [
     "img[src*='verify']",
     "img[alt*='验证码']",
     "img[alt*='captcha']",
+    "img[src*='checkcode']",
     "#captcha-image",
     ".captcha-image",
 ]

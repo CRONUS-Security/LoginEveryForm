@@ -374,7 +374,7 @@ class BrowserAutomation:
 
             # 先检测页面上的失败提示（避免仅因 URL 变化误判为成功）
             error_patterns = [
-                "text=/错误|失败|error|failed|invalid|incorrect|unable to login|cannot login|login failed|access denied/i",
+                "text=/错误|失败|error|failed|invalid|incorrect|unable to login|cannot login|login failed|access denied|not match/i",
                 ".error",
                 ".alert-error",
                 ".alert-danger",

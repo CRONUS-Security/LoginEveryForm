@@ -15,4 +15,5 @@ CAPTCHA_PATTERNS = [
     "input[name*='code']",
     "input[id*='code']",
     "input[placeholder*='code']",
+    "input[id*='TextBoxCode']"
 ]
