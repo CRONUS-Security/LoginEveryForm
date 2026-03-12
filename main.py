@@ -5,6 +5,7 @@ Main GUI Application using PySide6
 
 import sys
 import asyncio
+import random
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -45,7 +46,8 @@ class LoginWorker(QThread):
         captcha_selector: Optional[str],
         submit_selector: Optional[str],
         success_indicator: Optional[str],
-        delay: int
+        delay: int,
+        delay_jitter: float
     ):
         super().__init__()
         self.url = url
@@ -58,6 +60,7 @@ class LoginWorker(QThread):
         self.submit_selector = submit_selector if submit_selector else None
         self.success_indicator = success_indicator if success_indicator else None
         self.delay = delay
+        self.delay_jitter = max(0.0, min(1.0, delay_jitter))
         self._is_running = True
 
     def run(self):
@@ -103,9 +106,11 @@ class LoginWorker(QThread):
                 results.append(result)
                 self.result.emit(result)
 
-                # Delay between attempts
+                # Delay between attempts (with jitter)
                 if idx < total and self._is_running:
-                    await asyncio.sleep(self.delay / 1000)
+                    multiplier = random.uniform(1 - self.delay_jitter, 1 + self.delay_jitter)
+                    actual_ms = max(0, self.delay * multiplier)
+                    await asyncio.sleep(actual_ms / 1000)
 
             self.finished.emit(results)
 
@@ -292,8 +297,17 @@ class MainWindow(QMainWindow):
         self.delay_spin.setMinimum(0)
         self.delay_spin.setMaximum(10000)
         self.delay_spin.setSingleStep(100)
-        self.delay_spin.setValue(Config.DEFAULT_DELAY_BETWEEN_ATTEMPTS)
+        self.delay_spin.setValue(Config.ATTEMPT_DELAY_MS)
         browser_layout.addWidget(self.delay_spin)
+
+        browser_layout.addWidget(QLabel("Delay jitter (%):"))
+        self.delay_jitter_spin = QSpinBox()
+        self.delay_jitter_spin.setMinimum(0)
+        self.delay_jitter_spin.setMaximum(100)
+        self.delay_jitter_spin.setSuffix("%")
+        self.delay_jitter_spin.setValue(int(Config.ATTEMPT_DELAY_JITTER * 100))
+        self.delay_jitter_spin.setToolTip("Random jitter applied to delay (e.g. 30% → delay × 0.7~1.3)")
+        browser_layout.addWidget(self.delay_jitter_spin)
 
         browser_group.setLayout(browser_layout)
         layout.addWidget(browser_group)
@@ -505,7 +519,8 @@ class MainWindow(QMainWindow):
             captcha_selector=captcha_selector,
             submit_selector=submit_selector,
             success_indicator=success_indicator,
-            delay=self.delay_spin.value()
+            delay=self.delay_spin.value(),
+            delay_jitter=self.delay_jitter_spin.value() / 100.0
         )
 
         self.worker.progress.connect(self.update_progress)

@@ -28,7 +28,9 @@ class Config:
 
     # Login Settings
     DEFAULT_WAIT_AFTER_SUBMIT = 3000  # milliseconds
-    DEFAULT_DELAY_BETWEEN_ATTEMPTS = 2000  # milliseconds
+    DEFAULT_DELAY_BETWEEN_ATTEMPTS = 2000  # milliseconds (legacy alias)
+    ATTEMPT_DELAY_MS = 2000  # delay between each login attempt (ms)
+    ATTEMPT_DELAY_JITTER = 0.30  # jitter 0~1, e.g. 0.30 = ±30%
 
     # Excel Settings
     DEFAULT_USERNAME_COLUMN = 0
