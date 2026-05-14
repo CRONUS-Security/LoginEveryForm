@@ -92,6 +92,7 @@ class BrowserAutomation:
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None  # persistent page for "none" isolation mode
         self.captcha_solver = CaptchaSolver()
 
         self.logger.info(f"Browser automation initialized (type={browser_type.value}, headless={headless})")
@@ -132,6 +133,9 @@ class BrowserAutomation:
     async def stop(self):
         """Stop browser instance"""
         try:
+            if self.page:
+                await self.page.close()
+                self.page = None
             if self.context:
                 await self.context.close()
             if self.browser:
@@ -254,18 +258,26 @@ class BrowserAutomation:
         """
         page = None
         screenshot_path = None
+        # Track whether this call owns the page lifecycle (should close it when done)
+        owns_page = True
 
         try:
-            # Apply session isolation: "medium" clears cookies before each attempt.
-            # "none" / "high" skip this step (for "high", the worker spawns a new
-            # BrowserAutomation instance per attempt so clearing is unnecessary).
-            if session_isolation == "medium" and self.context:
+            # Apply session isolation strategy
+            if session_isolation == "none":
+                # Reuse the persistent page; create it only on the first call
+                if self.page is None or self.page.is_closed():
+                    self.page = await self.context.new_page()
+                    self.page.set_default_timeout(self.timeout)
+                page = self.page
+                owns_page = False  # page lifecycle is managed by stop()
+            elif session_isolation == "medium" and self.context:
                 await self.context.clear_cookies()
                 self.logger.debug("Cleared cookies and session state for this attempt")
 
-            # Create new page
-            page = await self.context.new_page()
-            page.set_default_timeout(self.timeout)
+            if page is None:
+                # "medium" or "high": fresh page per attempt
+                page = await self.context.new_page()
+                page.set_default_timeout(self.timeout)
 
             # Navigate to login page
             self.logger.info(f"Navigating to: {url}")
@@ -359,7 +371,7 @@ class BrowserAutomation:
             return LoginResult(LoginStatus.ERROR, credential, url, msg, screenshot_path)
 
         finally:
-            if page:
+            if page and owns_page:
                 await page.close()
 
     async def _verify_login_success(
