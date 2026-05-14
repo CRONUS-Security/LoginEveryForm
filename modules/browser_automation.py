@@ -224,6 +224,7 @@ class BrowserAutomation:
         username_selector: Optional[str] = None,
         password_selector: Optional[str] = None,
         captcha_selector: Optional[str] = None,
+        captcha_image_selector: Optional[str] = None,
         submit_selector: Optional[str] = None,
         success_indicator: Optional[str] = None,
         wait_after_submit: int = 3000
@@ -236,7 +237,8 @@ class BrowserAutomation:
             credential: Credential object with username/password
             username_selector: CSS selector for username field (auto-detect if None)
             password_selector: CSS selector for password field (auto-detect if None)
-            captcha_selector: CSS selector for captcha field (auto-detect if None)
+            captcha_selector: CSS selector for captcha text input (auto-detect if None)
+            captcha_image_selector: CSS selector for captcha image element (auto-detect if None)
             submit_selector: CSS selector for submit button (auto-detect if None)
             success_indicator: CSS selector or URL pattern to verify success
             wait_after_submit: Time to wait after submit (milliseconds)
@@ -295,7 +297,7 @@ class BrowserAutomation:
             # Handle captcha if present
             if captcha_selector:
                 self.logger.info("Captcha field detected, attempting to solve...")
-                captcha_text = await self.solve_captcha(page)
+                captcha_text = await self.solve_captcha(page, captcha_selector=captcha_image_selector)
 
                 if captcha_text:
                     await page.fill(captcha_selector, captcha_text)
@@ -454,6 +456,7 @@ class BrowserAutomation:
         username_selector: Optional[str] = None,
         password_selector: Optional[str] = None,
         captcha_selector: Optional[str] = None,
+        captcha_image_selector: Optional[str] = None,
         submit_selector: Optional[str] = None,
         success_indicator: Optional[str] = None,
         delay_between_attempts: int = 2000
@@ -488,6 +491,7 @@ class BrowserAutomation:
                 username_selector=username_selector,
                 password_selector=password_selector,
                 captcha_selector=captcha_selector,
+                captcha_image_selector=captcha_image_selector,
                 submit_selector=submit_selector,
                 success_indicator=success_indicator
             )

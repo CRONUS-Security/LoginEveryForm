@@ -104,12 +104,13 @@ async def _query_in_scope(page: Page, scope: str, selector: str):
 async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
     """
     根据 form_detection 下各规则文件中的选择器，自动检测登录表单控件。
-    返回 {"username": str|None, "password": str|None, "captcha": str|None, "submit": str|None}。
+    返回 {"username": str|None, "password": str|None, "captcha": str|None, "captcha_image": str|None, "submit": str|None}。
     """
     selectors = {
         "username": None,
         "password": None,
         "captcha": None,
+        "captcha_image": None,
         "submit": None,
     }
 
@@ -182,6 +183,21 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
                 if el:
                     selectors["submit"] = pattern
                     logger.debug(f"Submit button (page fallback): {pattern}")
+                    break
+
+        # ----- 验证码图片 -----
+        for pattern in get_captcha_image_patterns():
+            el = await _query_in_scope(page, scope, pattern)
+            if el:
+                selectors["captcha_image"] = f"{scope} >> {pattern}" if scope else pattern
+                logger.debug(f"Captcha image found: {selectors['captcha_image']}")
+                break
+        if not selectors["captcha_image"]:
+            for pattern in get_captcha_image_patterns():
+                el = await page.query_selector(pattern)
+                if el:
+                    selectors["captcha_image"] = pattern
+                    logger.debug(f"Captcha image (page fallback): {pattern}")
                     break
 
         return selectors

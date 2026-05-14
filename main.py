@@ -44,10 +44,12 @@ class LoginWorker(QThread):
         username_selector: Optional[str],
         password_selector: Optional[str],
         captcha_selector: Optional[str],
+        captcha_image_selector: Optional[str],
         submit_selector: Optional[str],
         success_indicator: Optional[str],
         delay: int,
-        delay_jitter: float
+        delay_jitter: float,
+        enable_captcha: bool = True,
     ):
         super().__init__()
         self.url = url
@@ -56,7 +58,9 @@ class LoginWorker(QThread):
         self.headless = headless
         self.username_selector = username_selector if username_selector else None
         self.password_selector = password_selector if password_selector else None
-        self.captcha_selector = captcha_selector if captcha_selector else None
+        # Honour enable_captcha flag: if disabled, treat captcha fields as absent
+        self.captcha_selector = (captcha_selector if captcha_selector else None) if enable_captcha else None
+        self.captcha_image_selector = (captcha_image_selector if captcha_image_selector else None) if enable_captcha else None
         self.submit_selector = submit_selector if submit_selector else None
         self.success_indicator = success_indicator if success_indicator else None
         self.delay = delay
@@ -99,6 +103,7 @@ class LoginWorker(QThread):
                     username_selector=self.username_selector,
                     password_selector=self.password_selector,
                     captcha_selector=self.captcha_selector,
+                    captcha_image_selector=self.captcha_image_selector,
                     submit_selector=self.submit_selector,
                     success_indicator=self.success_indicator
                 )
@@ -504,6 +509,28 @@ class MainWindow(QMainWindow):
         captcha_selector_layout.addWidget(_make_pick_btn("captcha", self.captcha_selector_input))
         selector_layout.addLayout(captcha_selector_layout)
 
+        # Captcha image selector
+        captcha_image_selector_layout = QHBoxLayout()
+        captcha_image_selector_layout.addWidget(QLabel("Captcha Image:"))
+        self.captcha_image_selector_input = QLineEdit()
+        self.captcha_image_selector_input.setPlaceholderText("CSS selector, e.g., img.captcha-img")
+        captcha_image_selector_layout.addWidget(self.captcha_image_selector_input)
+        captcha_image_selector_layout.addWidget(_make_pick_btn("captcha_image", self.captcha_image_selector_input))
+        selector_layout.addLayout(captcha_image_selector_layout)
+
+        # Enable captcha recognition toggle
+        captcha_enable_layout = QHBoxLayout()
+        self.enable_captcha_check = QCheckBox("Enable captcha recognition and auto-fill")
+        self.enable_captcha_check.setChecked(True)
+        self.enable_captcha_check.setToolTip(
+            "When checked, the captcha image will be solved automatically and filled into the captcha field.\n"
+            "Uncheck to skip captcha handling entirely (captcha selectors above will be ignored)."
+        )
+        self.enable_captcha_check.toggled.connect(self._on_captcha_enable_toggled)
+        captcha_enable_layout.addWidget(self.enable_captcha_check)
+        captcha_enable_layout.addStretch()
+        selector_layout.addLayout(captcha_enable_layout)
+
         # Submit selector
         submit_selector_layout = QHBoxLayout()
         submit_selector_layout.addWidget(QLabel("Submit Button:"))
@@ -665,8 +692,10 @@ class MainWindow(QMainWindow):
         username_selector = self.username_selector_input.text().strip() or None
         password_selector = self.password_selector_input.text().strip() or None
         captcha_selector = self.captcha_selector_input.text().strip() or None
+        captcha_image_selector = self.captcha_image_selector_input.text().strip() or None
         submit_selector = self.submit_selector_input.text().strip() or None
         success_indicator = self.success_indicator_input.text().strip() or None
+        enable_captcha = self.enable_captcha_check.isChecked()
 
         # Clear previous results
         self.results.clear()
@@ -682,10 +711,12 @@ class MainWindow(QMainWindow):
             username_selector=username_selector,
             password_selector=password_selector,
             captcha_selector=captcha_selector,
+            captcha_image_selector=captcha_image_selector,
             submit_selector=submit_selector,
             success_indicator=success_indicator,
             delay=self.delay_spin.value(),
-            delay_jitter=self.delay_jitter_spin.value() / 100.0
+            delay_jitter=self.delay_jitter_spin.value() / 100.0,
+            enable_captcha=enable_captcha,
         )
 
         self.worker.progress.connect(self.update_progress)
@@ -736,18 +767,21 @@ class MainWindow(QMainWindow):
         username = selectors.get("username") or ""
         password = selectors.get("password") or ""
         captcha = selectors.get("captcha") or ""
+        captcha_image = selectors.get("captcha_image") or ""
         submit = selectors.get("submit") or ""
 
         self.username_selector_input.setText(username)
         self.password_selector_input.setText(password)
         self.captcha_selector_input.setText(captcha)
+        self.captcha_image_selector_input.setText(captcha_image)
         self.submit_selector_input.setText(submit)
 
         self.log("Check: Detected selectors filled.")
-        self.log(f"  Username: {username or '(none)'}")
-        self.log(f"  Password: {password or '(none)'}")
-        self.log(f"  Captcha:  {captcha or '(none)'}")
-        self.log(f"  Submit:   {submit or '(none)'}")
+        self.log(f"  Username:      {username or '(none)'}")
+        self.log(f"  Password:      {password or '(none)'}")
+        self.log(f"  Captcha:       {captcha or '(none)'}")
+        self.log(f"  Captcha Image: {captcha_image or '(none)'}")
+        self.log(f"  Submit:        {submit or '(none)'}")
         self.statusBar().showMessage("Detection complete. Selectors filled.")
 
         # Prompt interactive picker when required fields could not be located
@@ -785,6 +819,11 @@ class MainWindow(QMainWindow):
         if self.check_worker and self.check_worker.isFinished():
             self.check_worker = None
 
+    def _on_captcha_enable_toggled(self, enabled: bool):
+        """Enable or disable captcha selector inputs based on the checkbox state."""
+        self.captcha_selector_input.setEnabled(enabled)
+        self.captcha_image_selector_input.setEnabled(enabled)
+
     def _start_interactive_picker(self, field_key: str, input_widget: QLineEdit):
         """Launch the interactive element picker for the specified field."""
         url = self.url_input.text().strip()
@@ -803,6 +842,7 @@ class MainWindow(QMainWindow):
             "username": "Username Field",
             "password": "Password Field",
             "captcha": "Captcha Field",
+            "captcha_image": "Captcha Image",
             "submit": "Submit Button",
         }
         label = field_labels.get(field_key, field_key)
