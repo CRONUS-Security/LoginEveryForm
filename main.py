@@ -689,7 +689,7 @@ class MainWindow(QMainWindow):
             "Open a browser window and guide you through selecting each form element in order.\n"
             "Captcha fields are included only when 'Enable captcha recognition' is checked above."
         )
-        self._pick_all_btn.clicked.connect(self._start_guided_picker)
+        self._pick_all_btn.clicked.connect(lambda: self._start_guided_picker())
         pick_all_layout.addWidget(self._pick_all_btn)
         selector_layout.addLayout(pick_all_layout)
 
