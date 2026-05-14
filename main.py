@@ -373,6 +373,83 @@ class InteractiveSelectorWorker(QThread):
                 await automation.stop()
 
 
+class GuidedPickerWorker(QThread):
+    """Worker thread: open browser once, guide user through multiple fields sequentially."""
+
+    field_selected = Signal(str, str)  # (field_key, css_selector)
+    field_skipped = Signal(str)        # field_key skipped by Esc / timeout
+    all_done = Signal()
+    error = Signal(str)
+
+    # Same picker JS; __FIELD__ is replaced per-field at runtime.
+    _PICKER_JS = InteractiveSelectorWorker._PICKER_JS
+
+    def __init__(self, url: str, browser_type: str, fields: List[tuple]):
+        """
+        fields: ordered list of (field_key, field_label) pairs, e.g.
+                [("username", "Username Field"), ("password", "Password Field"), ...]
+        """
+        super().__init__()
+        self.url = url.strip()
+        self.browser_type = browser_type
+        self.fields = fields
+
+    def run(self):
+        try:
+            asyncio.run(self._async_run())
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+    async def _async_run(self):
+        automation = None
+        try:
+            browser_type_enum = BrowserType[self.browser_type.upper()]
+            automation = BrowserAutomation(
+                browser_type=browser_type_enum,
+                headless=False,
+                screenshot_dir=str(Config.SCREENSHOTS_DIR),
+            )
+            await automation.start()
+
+            page = await automation.context.new_page()
+            page.set_default_timeout(automation.timeout)
+            await page.goto(self.url, wait_until="domcontentloaded")
+            await page.wait_for_load_state("load", timeout=automation.timeout)
+
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def on_selector_reported(selector: str) -> None:
+                await queue.put(selector)
+
+            await page.expose_function("__reportSelector", on_selector_reported)
+
+            for field_key, field_label in self.fields:
+                js = self._PICKER_JS.replace("__FIELD__", field_label)
+                await page.evaluate(js)
+
+                try:
+                    selector = await asyncio.wait_for(queue.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    self.field_skipped.emit(field_key)
+                    break
+
+                if selector:
+                    self.field_selected.emit(field_key, selector)
+                else:
+                    self.field_skipped.emit(field_key)
+
+            await page.close()
+            self.all_done.emit()
+
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+        finally:
+            if automation:
+                await automation.stop()
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
 
@@ -389,9 +466,7 @@ class MainWindow(QMainWindow):
         self.check_worker: Optional[CheckFormWorker] = None
         self.results: List[LoginResult] = []
 
-        self._picker_worker: Optional[InteractiveSelectorWorker] = None
-        self._picker_target_input: Optional[QLineEdit] = None
-        self._pending_picker_fields: List[tuple] = []  # list of (field_key, QLineEdit)
+        self._guided_picker_worker: Optional[GuidedPickerWorker] = None
 
         self.init_ui()
         self.logger.info("Application started")
@@ -546,20 +621,12 @@ class MainWindow(QMainWindow):
         selector_group = QGroupBox("Form Selectors (Optional - Leave Blank for Auto Detection)")
         selector_layout = QVBoxLayout()
 
-        def _make_pick_btn(field_key: str, input_widget: QLineEdit) -> QPushButton:
-            btn = QPushButton("Pick")
-            btn.setToolTip("Interactively select this element in the browser")
-            btn.setFixedWidth(48)
-            btn.clicked.connect(lambda: self._start_interactive_picker(field_key, input_widget))
-            return btn
-
         # Username selector
         username_selector_layout = QHBoxLayout()
         username_selector_layout.addWidget(QLabel("Username Field:"))
         self.username_selector_input = QLineEdit()
         self.username_selector_input.setPlaceholderText("CSS selector, e.g., input[name='username']")
         username_selector_layout.addWidget(self.username_selector_input)
-        username_selector_layout.addWidget(_make_pick_btn("username", self.username_selector_input))
         selector_layout.addLayout(username_selector_layout)
 
         # Password selector
@@ -568,8 +635,20 @@ class MainWindow(QMainWindow):
         self.password_selector_input = QLineEdit()
         self.password_selector_input.setPlaceholderText("CSS selector, e.g., input[type='password']")
         password_selector_layout.addWidget(self.password_selector_input)
-        password_selector_layout.addWidget(_make_pick_btn("password", self.password_selector_input))
         selector_layout.addLayout(password_selector_layout)
+
+        # Enable captcha recognition toggle (placed before captcha selectors so state is readable)
+        captcha_enable_layout = QHBoxLayout()
+        self.enable_captcha_check = QCheckBox("Enable captcha recognition and auto-fill")
+        self.enable_captcha_check.setChecked(True)
+        self.enable_captcha_check.setToolTip(
+            "When checked, the captcha image will be solved automatically and filled into the captcha field.\n"
+            "Uncheck to skip captcha handling entirely (captcha selectors below will be ignored)."
+        )
+        self.enable_captcha_check.toggled.connect(self._on_captcha_enable_toggled)
+        captcha_enable_layout.addWidget(self.enable_captcha_check)
+        captcha_enable_layout.addStretch()
+        selector_layout.addLayout(captcha_enable_layout)
 
         # Captcha selector
         captcha_selector_layout = QHBoxLayout()
@@ -577,7 +656,6 @@ class MainWindow(QMainWindow):
         self.captcha_selector_input = QLineEdit()
         self.captcha_selector_input.setPlaceholderText("CSS selector, e.g., input[name='captcha']")
         captcha_selector_layout.addWidget(self.captcha_selector_input)
-        captcha_selector_layout.addWidget(_make_pick_btn("captcha", self.captcha_selector_input))
         selector_layout.addLayout(captcha_selector_layout)
 
         # Captcha image selector
@@ -586,21 +664,7 @@ class MainWindow(QMainWindow):
         self.captcha_image_selector_input = QLineEdit()
         self.captcha_image_selector_input.setPlaceholderText("CSS selector, e.g., img.captcha-img")
         captcha_image_selector_layout.addWidget(self.captcha_image_selector_input)
-        captcha_image_selector_layout.addWidget(_make_pick_btn("captcha_image", self.captcha_image_selector_input))
         selector_layout.addLayout(captcha_image_selector_layout)
-
-        # Enable captcha recognition toggle
-        captcha_enable_layout = QHBoxLayout()
-        self.enable_captcha_check = QCheckBox("Enable captcha recognition and auto-fill")
-        self.enable_captcha_check.setChecked(True)
-        self.enable_captcha_check.setToolTip(
-            "When checked, the captcha image will be solved automatically and filled into the captcha field.\n"
-            "Uncheck to skip captcha handling entirely (captcha selectors above will be ignored)."
-        )
-        self.enable_captcha_check.toggled.connect(self._on_captcha_enable_toggled)
-        captcha_enable_layout.addWidget(self.enable_captcha_check)
-        captcha_enable_layout.addStretch()
-        selector_layout.addLayout(captcha_enable_layout)
 
         # Submit selector
         submit_selector_layout = QHBoxLayout()
@@ -608,7 +672,6 @@ class MainWindow(QMainWindow):
         self.submit_selector_input = QLineEdit()
         self.submit_selector_input.setPlaceholderText("CSS selector, e.g., button[type='submit']")
         submit_selector_layout.addWidget(self.submit_selector_input)
-        submit_selector_layout.addWidget(_make_pick_btn("submit", self.submit_selector_input))
         selector_layout.addLayout(submit_selector_layout)
 
         # Success indicator
@@ -618,6 +681,17 @@ class MainWindow(QMainWindow):
         self.success_indicator_input.setPlaceholderText("CSS selector or URL, e.g., #dashboard or /dashboard")
         success_indicator_layout.addWidget(self.success_indicator_input)
         selector_layout.addLayout(success_indicator_layout)
+
+        # Single guided "Pick All" button — opens the browser once and walks through all fields
+        pick_all_layout = QHBoxLayout()
+        self._pick_all_btn = QPushButton("🖱 Pick All Elements Interactively")
+        self._pick_all_btn.setToolTip(
+            "Open a browser window and guide you through selecting each form element in order.\n"
+            "Captcha fields are included only when 'Enable captcha recognition' is checked above."
+        )
+        self._pick_all_btn.clicked.connect(self._start_guided_picker)
+        pick_all_layout.addWidget(self._pick_all_btn)
+        selector_layout.addLayout(pick_all_layout)
 
         selector_group.setLayout(selector_layout)
         layout.addWidget(selector_group)
@@ -862,17 +936,22 @@ class MainWindow(QMainWindow):
         self.log(f"  Submit:        {submit or '(none)'}")
         self.statusBar().showMessage("Detection complete. Selectors filled.")
 
-        # Prompt interactive picker when required fields could not be located
+        # Prompt guided picker when required fields could not be located
         missing = []
         if not username:
-            missing.append(("username", self.username_selector_input))
+            missing.append("username")
         if not password:
-            missing.append(("password", self.password_selector_input))
+            missing.append("password")
         if not submit:
-            missing.append(("submit", self.submit_selector_input))
+            missing.append("submit")
 
         if missing:
-            missing_labels = ", ".join(k for k, _ in missing)
+            field_labels = {
+                "username": "Username Field",
+                "password": "Password Field",
+                "submit": "Submit Button",
+            }
+            missing_labels = ", ".join(field_labels[k] for k in missing)
             reply = QMessageBox.question(
                 self,
                 "Auto-Detection Incomplete",
@@ -882,8 +961,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
-                self._pending_picker_fields = list(missing[1:])
-                self._start_interactive_picker(missing[0][0], missing[0][1])
+                self._start_guided_picker(missing)
 
     def _on_check_error(self, error_msg: str):
         """Handle check worker error."""
@@ -906,17 +984,26 @@ class MainWindow(QMainWindow):
         """Enable or disable the session isolation strength combo based on the checkbox."""
         self.session_isolation_combo.setEnabled(enabled)
 
-    def _start_interactive_picker(self, field_key: str, input_widget: QLineEdit):
-        """Launch the interactive element picker for the specified field."""
+    def _field_inputs_map(self) -> Dict[str, QLineEdit]:
+        return {
+            "username": self.username_selector_input,
+            "password": self.password_selector_input,
+            "captcha": self.captcha_selector_input,
+            "captcha_image": self.captcha_image_selector_input,
+            "submit": self.submit_selector_input,
+        }
+
+    def _start_guided_picker(self, field_keys: Optional[List[str]] = None):
+        """Open the browser once and guide the user through selecting each field in order."""
         url = self.url_input.text().strip()
         if not url:
             QMessageBox.warning(self, "Error", "Please enter the target URL first.")
             return
 
-        if self._picker_worker and self._picker_worker.isRunning():
+        if self._guided_picker_worker and self._guided_picker_worker.isRunning():
             QMessageBox.information(
                 self, "Picker Active",
-                "An interactive picker is already running. Please complete or cancel it first."
+                "A guided picker is already running. Please complete or cancel it first."
             )
             return
 
@@ -927,52 +1014,55 @@ class MainWindow(QMainWindow):
             "captcha_image": "Captcha Image",
             "submit": "Submit Button",
         }
-        label = field_labels.get(field_key, field_key)
 
-        self._picker_target_input = input_widget
-        self._picker_worker = InteractiveSelectorWorker(
+        if field_keys is None:
+            # Build the full ordered list, respecting the captcha toggle
+            field_keys = ["username", "password"]
+            if self.enable_captcha_check.isChecked():
+                field_keys += ["captcha", "captcha_image"]
+            field_keys.append("submit")
+
+        fields = [(k, field_labels[k]) for k in field_keys if k in field_labels]
+        if not fields:
+            return
+
+        self._guided_picker_worker = GuidedPickerWorker(
             url=url,
             browser_type=self.browser_combo.currentText(),
-            field_label=label,
+            fields=fields,
         )
-        self._picker_worker.selected.connect(self._on_picker_selected)
-        self._picker_worker.cancelled.connect(self._on_picker_cancelled)
-        self._picker_worker.error.connect(self._on_picker_error)
-        self._picker_worker.finished.connect(self._on_picker_finished)
-        self._picker_worker.start()
+        self._guided_picker_worker.field_selected.connect(self._on_guided_field_selected)
+        self._guided_picker_worker.field_skipped.connect(self._on_guided_field_skipped)
+        self._guided_picker_worker.all_done.connect(self._on_guided_all_done)
+        self._guided_picker_worker.error.connect(self._on_guided_error)
+        self._guided_picker_worker.finished.connect(self._on_guided_finished)
+        self._guided_picker_worker.start()
 
-        self.statusBar().showMessage(f"Interactive picker active: click the {label} in the browser...")
-        self.log(f"Interactive picker started for '{label}'. Click the element in the browser window, or press Esc to cancel.")
+        field_names = " → ".join(field_labels[k] for k in field_keys if k in field_labels)
+        self.statusBar().showMessage(f"Guided picker: {field_names}")
+        self.log(f"Guided picker started. Browser will open — click each element in order: {field_names}")
+        self._pick_all_btn.setEnabled(False)
 
-    def _on_picker_selected(self, selector: str):
-        """Fill the target input with the picked CSS selector."""
-        if self._picker_target_input is not None:
-            self._picker_target_input.setText(selector)
-            self.log(f"  Selector picked: {selector}")
-        self._continue_pending_picker()
+    def _on_guided_field_selected(self, field_key: str, selector: str):
+        inputs_map = self._field_inputs_map()
+        if field_key in inputs_map:
+            inputs_map[field_key].setText(selector)
+            self.log(f"  [{field_key}] Selector picked: {selector}")
 
-    def _on_picker_cancelled(self):
-        """Handle picker cancellation."""
-        self.log("Interactive picker cancelled.")
-        self._continue_pending_picker()
+    def _on_guided_field_skipped(self, field_key: str):
+        self.log(f"  [{field_key}] Skipped (Esc or timeout).")
 
-    def _on_picker_error(self, error_msg: str):
-        """Handle picker error."""
-        self.log(f"Interactive picker error: {error_msg}")
-        self._continue_pending_picker()
+    def _on_guided_all_done(self):
+        self.statusBar().showMessage("Guided picker complete.")
+        self.log("Guided picker: all fields processed.")
 
-    def _on_picker_finished(self):
-        """Clean up picker worker reference after it has finished."""
-        self._picker_worker = None
-        self._picker_target_input = None
+    def _on_guided_error(self, error_msg: str):
+        self.log(f"Guided picker error: {error_msg}")
+        QMessageBox.critical(self, "Picker Error", error_msg)
 
-    def _continue_pending_picker(self):
-        """Start the next queued field picker, or mark the workflow complete."""
-        if self._pending_picker_fields:
-            field_key, input_widget = self._pending_picker_fields.pop(0)
-            self._start_interactive_picker(field_key, input_widget)
-        else:
-            self.statusBar().showMessage("Interactive picker workflow complete.")
+    def _on_guided_finished(self):
+        self._guided_picker_worker = None
+        self._pick_all_btn.setEnabled(True)
 
     def update_progress(self, current: int, total: int, message: str):
         """Update progress"""
