@@ -174,6 +174,156 @@ class CheckFormWorker(QThread):
                 await automation.stop()
 
 
+class InteractiveSelectorWorker(QThread):
+    """Worker thread: open browser, inject element picker JS, wait for user to click an element."""
+
+    selected = Signal(str)   # emits CSS selector on successful pick
+    cancelled = Signal()     # emits when user presses Esc or times out
+    error = Signal(str)
+
+    # Injected into the page; __FIELD__ is replaced with the field label at runtime.
+    _PICKER_JS = r"""
+(function() {
+    if (window.__selectorPickerActive) return;
+    window.__selectorPickerActive = true;
+
+    var banner = document.createElement('div');
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#1565C0;color:#fff;padding:10px 16px;font:bold 14px/1.4 sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.45);pointer-events:none;';
+    banner.textContent = 'ELEMENT PICKER (__FIELD__): Click the element to select it. Press Esc to cancel.';
+    document.body.appendChild(banner);
+
+    var hi = document.createElement('div');
+    hi.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;background:rgba(21,101,192,.18);border:2px solid #1565C0;box-sizing:border-box;';
+    document.body.appendChild(hi);
+
+    function cssEscape(s) {
+        if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
+        return s.replace(/([\x00-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e])/g, '\\$1');
+    }
+
+    function getSelector(el) {
+        if (!el || el.nodeType !== 1) return '';
+        if (el === document.body) return 'body';
+        if (el.id) return '#' + cssEscape(el.id);
+        var name = el.getAttribute('name');
+        if (name) return el.tagName.toLowerCase() + '[name="' + name + '"]';
+        if (el.tagName.toLowerCase() === 'input' && el.type) return 'input[type="' + el.type + '"]';
+        var parts = [];
+        var cur = el;
+        while (cur && cur !== document.body) {
+            var seg = cur.tagName.toLowerCase();
+            if (cur.id) { parts.unshift('#' + cssEscape(cur.id)); break; }
+            var sibs = cur.parentNode ? Array.from(cur.parentNode.children).filter(function(c) { return c.tagName === cur.tagName; }) : [];
+            if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+            parts.unshift(seg);
+            cur = cur.parentElement;
+        }
+        return parts.join(' > ');
+    }
+
+    function onMove(e) {
+        var el = document.elementFromPoint(e.clientX, e.clientY);
+        while (el && (el === hi || el === banner)) el = el.parentElement;
+        if (!el) return;
+        var r = el.getBoundingClientRect();
+        hi.style.left = (r.left + window.scrollX) + 'px';
+        hi.style.top = (r.top + window.scrollY) + 'px';
+        hi.style.width = r.width + 'px';
+        hi.style.height = r.height + 'px';
+    }
+
+    function onClick(e) {
+        var el = e.target;
+        while (el && (el === hi || el === banner)) el = el.parentElement;
+        if (!el) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        var sel = getSelector(el);
+        cleanup();
+        window.__reportSelector(sel);
+    }
+
+    function onKey(e) {
+        if (e.key === 'Escape') { cleanup(); window.__reportSelector(''); }
+    }
+
+    function cleanup() {
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('click', onClick, true);
+        document.removeEventListener('keydown', onKey, true);
+        if (hi.parentNode) hi.parentNode.removeChild(hi);
+        if (banner.parentNode) banner.parentNode.removeChild(banner);
+        window.__selectorPickerActive = false;
+    }
+
+    document.addEventListener('mousemove', onMove, true);
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('keydown', onKey, true);
+})();
+"""
+
+    def __init__(self, url: str, browser_type: str, field_label: str = "Element"):
+        super().__init__()
+        self.url = url.strip()
+        self.browser_type = browser_type
+        self.field_label = field_label
+
+    def run(self):
+        try:
+            asyncio.run(self._async_run())
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+    async def _async_run(self):
+        automation = None
+        try:
+            browser_type_enum = BrowserType[self.browser_type.upper()]
+            automation = BrowserAutomation(
+                browser_type=browser_type_enum,
+                headless=False,  # interactive picker always requires a visible browser
+                screenshot_dir=str(Config.SCREENSHOTS_DIR),
+            )
+            await automation.start()
+
+            page = await automation.context.new_page()
+            page.set_default_timeout(automation.timeout)
+            await page.goto(self.url, wait_until="domcontentloaded")
+            await page.wait_for_load_state("load", timeout=automation.timeout)
+
+            selected_event = asyncio.Event()
+            selected_value: Dict[str, Optional[str]] = {"selector": None}
+
+            async def on_selector_reported(selector: str) -> None:
+                selected_value["selector"] = selector
+                selected_event.set()
+
+            await page.expose_function("__reportSelector", on_selector_reported)
+
+            js = self._PICKER_JS.replace("__FIELD__", self.field_label)
+            await page.evaluate(js)
+
+            try:
+                await asyncio.wait_for(selected_event.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                self.cancelled.emit()
+                return
+
+            await page.close()
+            selector = selected_value["selector"]
+            if selector:
+                self.selected.emit(selector)
+            else:
+                self.cancelled.emit()
+
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+        finally:
+            if automation:
+                await automation.stop()
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
 
@@ -189,6 +339,10 @@ class MainWindow(QMainWindow):
         self.worker: Optional[LoginWorker] = None
         self.check_worker: Optional[CheckFormWorker] = None
         self.results: List[LoginResult] = []
+
+        self._picker_worker: Optional[InteractiveSelectorWorker] = None
+        self._picker_target_input: Optional[QLineEdit] = None
+        self._pending_picker_fields: List[tuple] = []  # list of (field_key, QLineEdit)
 
         self.init_ui()
         self.logger.info("Application started")
@@ -316,12 +470,20 @@ class MainWindow(QMainWindow):
         selector_group = QGroupBox("Form Selectors (Optional - Leave Blank for Auto Detection)")
         selector_layout = QVBoxLayout()
 
+        def _make_pick_btn(field_key: str, input_widget: QLineEdit) -> QPushButton:
+            btn = QPushButton("Pick")
+            btn.setToolTip("Interactively select this element in the browser")
+            btn.setFixedWidth(48)
+            btn.clicked.connect(lambda: self._start_interactive_picker(field_key, input_widget))
+            return btn
+
         # Username selector
         username_selector_layout = QHBoxLayout()
         username_selector_layout.addWidget(QLabel("Username Field:"))
         self.username_selector_input = QLineEdit()
         self.username_selector_input.setPlaceholderText("CSS selector, e.g., input[name='username']")
         username_selector_layout.addWidget(self.username_selector_input)
+        username_selector_layout.addWidget(_make_pick_btn("username", self.username_selector_input))
         selector_layout.addLayout(username_selector_layout)
 
         # Password selector
@@ -330,6 +492,7 @@ class MainWindow(QMainWindow):
         self.password_selector_input = QLineEdit()
         self.password_selector_input.setPlaceholderText("CSS selector, e.g., input[type='password']")
         password_selector_layout.addWidget(self.password_selector_input)
+        password_selector_layout.addWidget(_make_pick_btn("password", self.password_selector_input))
         selector_layout.addLayout(password_selector_layout)
 
         # Captcha selector
@@ -338,6 +501,7 @@ class MainWindow(QMainWindow):
         self.captcha_selector_input = QLineEdit()
         self.captcha_selector_input.setPlaceholderText("CSS selector, e.g., input[name='captcha']")
         captcha_selector_layout.addWidget(self.captcha_selector_input)
+        captcha_selector_layout.addWidget(_make_pick_btn("captcha", self.captcha_selector_input))
         selector_layout.addLayout(captcha_selector_layout)
 
         # Submit selector
@@ -346,6 +510,7 @@ class MainWindow(QMainWindow):
         self.submit_selector_input = QLineEdit()
         self.submit_selector_input.setPlaceholderText("CSS selector, e.g., button[type='submit']")
         submit_selector_layout.addWidget(self.submit_selector_input)
+        submit_selector_layout.addWidget(_make_pick_btn("submit", self.submit_selector_input))
         selector_layout.addLayout(submit_selector_layout)
 
         # Success indicator
@@ -585,6 +750,29 @@ class MainWindow(QMainWindow):
         self.log(f"  Submit:   {submit or '(none)'}")
         self.statusBar().showMessage("Detection complete. Selectors filled.")
 
+        # Prompt interactive picker when required fields could not be located
+        missing = []
+        if not username:
+            missing.append(("username", self.username_selector_input))
+        if not password:
+            missing.append(("password", self.password_selector_input))
+        if not submit:
+            missing.append(("submit", self.submit_selector_input))
+
+        if missing:
+            missing_labels = ", ".join(k for k, _ in missing)
+            reply = QMessageBox.question(
+                self,
+                "Auto-Detection Incomplete",
+                f"Could not auto-detect the following required elements:\n  {missing_labels}\n\n"
+                "Launch the interactive element picker to select them manually?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._pending_picker_fields = list(missing[1:])
+                self._start_interactive_picker(missing[0][0], missing[0][1])
+
     def _on_check_error(self, error_msg: str):
         """Handle check worker error."""
         self.log(f"Check error: {error_msg}")
@@ -596,6 +784,73 @@ class MainWindow(QMainWindow):
         self.check_button.setEnabled(True)
         if self.check_worker and self.check_worker.isFinished():
             self.check_worker = None
+
+    def _start_interactive_picker(self, field_key: str, input_widget: QLineEdit):
+        """Launch the interactive element picker for the specified field."""
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Error", "Please enter the target URL first.")
+            return
+
+        if self._picker_worker and self._picker_worker.isRunning():
+            QMessageBox.information(
+                self, "Picker Active",
+                "An interactive picker is already running. Please complete or cancel it first."
+            )
+            return
+
+        field_labels: Dict[str, str] = {
+            "username": "Username Field",
+            "password": "Password Field",
+            "captcha": "Captcha Field",
+            "submit": "Submit Button",
+        }
+        label = field_labels.get(field_key, field_key)
+
+        self._picker_target_input = input_widget
+        self._picker_worker = InteractiveSelectorWorker(
+            url=url,
+            browser_type=self.browser_combo.currentText(),
+            field_label=label,
+        )
+        self._picker_worker.selected.connect(self._on_picker_selected)
+        self._picker_worker.cancelled.connect(self._on_picker_cancelled)
+        self._picker_worker.error.connect(self._on_picker_error)
+        self._picker_worker.finished.connect(self._on_picker_finished)
+        self._picker_worker.start()
+
+        self.statusBar().showMessage(f"Interactive picker active: click the {label} in the browser...")
+        self.log(f"Interactive picker started for '{label}'. Click the element in the browser window, or press Esc to cancel.")
+
+    def _on_picker_selected(self, selector: str):
+        """Fill the target input with the picked CSS selector."""
+        if self._picker_target_input is not None:
+            self._picker_target_input.setText(selector)
+            self.log(f"  Selector picked: {selector}")
+        self._continue_pending_picker()
+
+    def _on_picker_cancelled(self):
+        """Handle picker cancellation."""
+        self.log("Interactive picker cancelled.")
+        self._continue_pending_picker()
+
+    def _on_picker_error(self, error_msg: str):
+        """Handle picker error."""
+        self.log(f"Interactive picker error: {error_msg}")
+        self._continue_pending_picker()
+
+    def _on_picker_finished(self):
+        """Clean up picker worker reference after it has finished."""
+        self._picker_worker = None
+        self._picker_target_input = None
+
+    def _continue_pending_picker(self):
+        """Start the next queued field picker, or mark the workflow complete."""
+        if self._pending_picker_fields:
+            field_key, input_widget = self._pending_picker_fields.pop(0)
+            self._start_interactive_picker(field_key, input_widget)
+        else:
+            self.statusBar().showMessage("Interactive picker workflow complete.")
 
     def update_progress(self, current: int, total: int, message: str):
         """Update progress"""
