@@ -32,6 +32,13 @@ class Config:
     ATTEMPT_DELAY_MS = 2000  # delay between each login attempt (ms)
     ATTEMPT_DELAY_JITTER = 0.30  # jitter 0~1, e.g. 0.30 = ±30%
 
+    # Session Isolation Settings
+    # "none"   – keep browser/context/page alive; only refill form fields
+    # "medium" – reset session context (clear cookies etc.) between attempts
+    # "high"   – launch a brand-new browser instance for every credential
+    DEFAULT_SESSION_ISOLATION_ENABLED = False
+    DEFAULT_SESSION_ISOLATION_LEVEL = "medium"  # "none" | "medium" | "high"
+
     # Excel Settings
     DEFAULT_USERNAME_COLUMN = 0
     DEFAULT_PASSWORD_COLUMN = 1

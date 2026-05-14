@@ -227,10 +227,11 @@ class BrowserAutomation:
         captcha_image_selector: Optional[str] = None,
         submit_selector: Optional[str] = None,
         success_indicator: Optional[str] = None,
-        wait_after_submit: int = 3000
+        wait_after_submit: int = 3000,
+        session_isolation: str = "medium",
     ) -> LoginResult:
         """
-        Attempt login with provided credentials
+        Attempt login with provided credentials.
 
         Args:
             url: Login page URL
@@ -242,6 +243,11 @@ class BrowserAutomation:
             submit_selector: CSS selector for submit button (auto-detect if None)
             success_indicator: CSS selector or URL pattern to verify success
             wait_after_submit: Time to wait after submit (milliseconds)
+            session_isolation: Isolation level for this attempt.
+                "none"   – reuse browser/context/page as-is (only refill form).
+                "medium" – clear cookies/session state before navigating (default).
+                "high"   – caller is responsible for providing a fresh browser instance;
+                           this method behaves like "none" in that case.
 
         Returns:
             LoginResult object
@@ -250,8 +256,10 @@ class BrowserAutomation:
         screenshot_path = None
 
         try:
-            # 每次测试前清空 cookie 和 session，保证独立登录环境，窗口保持不关
-            if self.context:
+            # Apply session isolation: "medium" clears cookies before each attempt.
+            # "none" / "high" skip this step (for "high", the worker spawns a new
+            # BrowserAutomation instance per attempt so clearing is unnecessary).
+            if session_isolation == "medium" and self.context:
                 await self.context.clear_cookies()
                 self.logger.debug("Cleared cookies and session state for this attempt")
 

@@ -50,6 +50,7 @@ class LoginWorker(QThread):
         delay: int,
         delay_jitter: float,
         enable_captcha: bool = True,
+        session_isolation: str = "none",
     ):
         super().__init__()
         self.url = url
@@ -65,6 +66,8 @@ class LoginWorker(QThread):
         self.success_indicator = success_indicator if success_indicator else None
         self.delay = delay
         self.delay_jitter = max(0.0, min(1.0, delay_jitter))
+        # "none" | "medium" | "high"
+        self.session_isolation = session_isolation
         self._is_running = True
 
     def run(self):
@@ -78,44 +81,85 @@ class LoginWorker(QThread):
         """Async execution"""
         automation = None
         try:
-            # Initialize browser
             browser_type_enum = BrowserType[self.browser_type.upper()]
-            automation = BrowserAutomation(
-                browser_type=browser_type_enum,
-                headless=self.headless,
-                screenshot_dir=str(Config.SCREENSHOTS_DIR)
-            )
 
-            await automation.start()
+            async def _make_automation() -> BrowserAutomation:
+                auto = BrowserAutomation(
+                    browser_type=browser_type_enum,
+                    headless=self.headless,
+                    screenshot_dir=str(Config.SCREENSHOTS_DIR)
+                )
+                await auto.start()
+                return auto
 
             results = []
             total = len(self.credentials)
 
-            for idx, credential in enumerate(self.credentials, 1):
-                if not self._is_running:
-                    break
+            if self.session_isolation == "high":
+                # High isolation: fresh browser instance per credential
+                for idx, credential in enumerate(self.credentials, 1):
+                    if not self._is_running:
+                        break
 
-                self.progress.emit(idx, total, f"Testing: {credential.username}")
+                    self.progress.emit(idx, total, f"Testing: {credential.username}")
 
-                result = await automation.attempt_login(
-                    url=self.url,
-                    credential=credential,
-                    username_selector=self.username_selector,
-                    password_selector=self.password_selector,
-                    captcha_selector=self.captcha_selector,
-                    captcha_image_selector=self.captcha_image_selector,
-                    submit_selector=self.submit_selector,
-                    success_indicator=self.success_indicator
-                )
+                    per_attempt_automation = None
+                    try:
+                        per_attempt_automation = await _make_automation()
+                        result = await per_attempt_automation.attempt_login(
+                            url=self.url,
+                            credential=credential,
+                            username_selector=self.username_selector,
+                            password_selector=self.password_selector,
+                            captcha_selector=self.captcha_selector,
+                            captcha_image_selector=self.captcha_image_selector,
+                            submit_selector=self.submit_selector,
+                            success_indicator=self.success_indicator,
+                            session_isolation="high",
+                        )
+                    finally:
+                        if per_attempt_automation:
+                            await per_attempt_automation.stop()
 
-                results.append(result)
-                self.result.emit(result)
+                    results.append(result)
+                    self.result.emit(result)
 
-                # Delay between attempts (with jitter)
-                if idx < total and self._is_running:
-                    multiplier = random.uniform(1 - self.delay_jitter, 1 + self.delay_jitter)
-                    actual_ms = max(0, self.delay * multiplier)
-                    await asyncio.sleep(actual_ms / 1000)
+                    if idx < total and self._is_running:
+                        multiplier = random.uniform(1 - self.delay_jitter, 1 + self.delay_jitter)
+                        actual_ms = max(0, self.delay * multiplier)
+                        await asyncio.sleep(actual_ms / 1000)
+
+            else:
+                # "none" or "medium": single shared browser instance
+                # Initialize browser
+                automation = await _make_automation()
+
+                for idx, credential in enumerate(self.credentials, 1):
+                    if not self._is_running:
+                        break
+
+                    self.progress.emit(idx, total, f"Testing: {credential.username}")
+
+                    result = await automation.attempt_login(
+                        url=self.url,
+                        credential=credential,
+                        username_selector=self.username_selector,
+                        password_selector=self.password_selector,
+                        captcha_selector=self.captcha_selector,
+                        captcha_image_selector=self.captcha_image_selector,
+                        submit_selector=self.submit_selector,
+                        success_indicator=self.success_indicator,
+                        session_isolation=self.session_isolation,
+                    )
+
+                    results.append(result)
+                    self.result.emit(result)
+
+                    # Delay between attempts (with jitter)
+                    if idx < total and self._is_running:
+                        multiplier = random.uniform(1 - self.delay_jitter, 1 + self.delay_jitter)
+                        actual_ms = max(0, self.delay * multiplier)
+                        await asyncio.sleep(actual_ms / 1000)
 
             self.finished.emit(results)
 
@@ -468,6 +512,33 @@ class MainWindow(QMainWindow):
         self.delay_jitter_spin.setToolTip("Random jitter applied to delay (e.g. 30% → delay × 0.7~1.3)")
         browser_layout.addWidget(self.delay_jitter_spin)
 
+        # Session isolation
+        browser_layout.addWidget(QLabel("Session Isolation:"))
+        self.session_isolation_check = QCheckBox("Enable")
+        self.session_isolation_check.setChecked(Config.DEFAULT_SESSION_ISOLATION_ENABLED)
+        self.session_isolation_check.setToolTip(
+            "Enable session isolation between credential attempts.\n"
+            "When disabled, the browser/context is fully reused across all attempts."
+        )
+        self.session_isolation_check.toggled.connect(self._on_session_isolation_toggled)
+        browser_layout.addWidget(self.session_isolation_check)
+
+        self.session_isolation_combo = QComboBox()
+        self.session_isolation_combo.addItem("最低 – 仅重填表单（不重置 Context/Page）", "none")
+        self.session_isolation_combo.addItem("中等 – 重置会话上下文（清除 Cookie 等）", "medium")
+        self.session_isolation_combo.addItem("最强 – 每次凭据尝试使用全新浏览器实例", "high")
+        _default_level_index = {"none": 0, "medium": 1, "high": 2}.get(
+            Config.DEFAULT_SESSION_ISOLATION_LEVEL, 0
+        )
+        self.session_isolation_combo.setCurrentIndex(_default_level_index)
+        self.session_isolation_combo.setEnabled(Config.DEFAULT_SESSION_ISOLATION_ENABLED)
+        self.session_isolation_combo.setToolTip(
+            "最低: 不关闭浏览器/Context/Page，仅重新填写表单字段并提交。\n"
+            "中等: 每次尝试前清除 Cookie 和会话数据，但保持浏览器进程运行。\n"
+            "最强: 为每一条凭据单独启动并销毁一个全新的浏览器实例。"
+        )
+        browser_layout.addWidget(self.session_isolation_combo)
+
         browser_group.setLayout(browser_layout)
         layout.addWidget(browser_group)
 
@@ -697,6 +768,12 @@ class MainWindow(QMainWindow):
         success_indicator = self.success_indicator_input.text().strip() or None
         enable_captcha = self.enable_captcha_check.isChecked()
 
+        # Determine session isolation level
+        if self.session_isolation_check.isChecked():
+            session_isolation = self.session_isolation_combo.currentData()
+        else:
+            session_isolation = "none"
+
         # Clear previous results
         self.results.clear()
         self.results_table.setRowCount(0)
@@ -717,6 +794,7 @@ class MainWindow(QMainWindow):
             delay=self.delay_spin.value(),
             delay_jitter=self.delay_jitter_spin.value() / 100.0,
             enable_captcha=enable_captcha,
+            session_isolation=session_isolation,
         )
 
         self.worker.progress.connect(self.update_progress)
@@ -823,6 +901,10 @@ class MainWindow(QMainWindow):
         """Enable or disable captcha selector inputs based on the checkbox state."""
         self.captcha_selector_input.setEnabled(enabled)
         self.captcha_image_selector_input.setEnabled(enabled)
+
+    def _on_session_isolation_toggled(self, enabled: bool):
+        """Enable or disable the session isolation strength combo based on the checkbox."""
+        self.session_isolation_combo.setEnabled(enabled)
 
     def _start_interactive_picker(self, field_key: str, input_widget: QLineEdit):
         """Launch the interactive element picker for the specified field."""
