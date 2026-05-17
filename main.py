@@ -686,6 +686,11 @@ class ResponseProbeWorker(QThread):
 
                 async def _on_response(response) -> None:
                     try:
+                        # Skip static assets that may still be in-flight from the initial page load
+                        resource_type = response.request.resource_type
+                        if resource_type in ("script", "stylesheet", "image", "font", "media", "other"):
+                            return
+
                         url      = response.url
                         method   = response.request.method
                         status   = response.status
