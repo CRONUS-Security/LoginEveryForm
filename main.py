@@ -630,6 +630,7 @@ class ResponseProbeWorker(QThread):
                                 "captcha": "识别失败",
                                 "url": self.url,
                                 "error_messages": ["验证码识别失败，无法完成场景探测"],
+                                "network_records": [],
                                 "screenshot": "",
                                 "status": "captcha_failed",
                             }
@@ -637,12 +638,56 @@ class ResponseProbeWorker(QThread):
                         captcha_status = f"已识别 ({captcha_text})"
                         await page.wait_for_timeout(200)
 
+                # ── Network capture: register handler before submit ──────────
+                network_records: List[Dict] = []
+
+                async def _on_response(response) -> None:
+                    try:
+                        url      = response.url
+                        method   = response.request.method
+                        status   = response.status
+                        ct       = response.headers.get("content-type", "")
+                        location = response.headers.get("location", "")
+
+                        post_data: Optional[str] = None
+                        try:
+                            raw_post = response.request.post_data
+                            if raw_post:
+                                post_data = raw_post[:600] + ("…" if len(raw_post) > 600 else "")
+                        except Exception:
+                            pass
+
+                        body_text: Optional[str] = None
+                        if any(t in ct for t in ["json", "text/plain", "text/html", "xml"]):
+                            try:
+                                raw_body = await response.text()
+                                body_text = raw_body[:1200] + ("…" if len(raw_body) > 1200 else "")
+                            except Exception:
+                                pass
+
+                        network_records.append({
+                            "url": url,
+                            "method": method,
+                            "status": status,
+                            "content_type": ct,
+                            "location": location,
+                            "post_data": post_data,
+                            "body": body_text,
+                        })
+                    except Exception:
+                        pass
+
+                page.on("response", _on_response)
+                # ─────────────────────────────────────────────────────────────
+
                 if self.submit_selector:
                     await page.click(self.submit_selector)
                 elif self.password_selector:
                     await page.press(self.password_selector, "Enter")
 
                 await page.wait_for_timeout(3000)
+
+                page.remove_listener("response", _on_response)
 
                 current_url = page.url
                 error_messages: List[str] = []
@@ -681,6 +726,7 @@ class ResponseProbeWorker(QThread):
                     "captcha": captcha_status,
                     "url": current_url,
                     "error_messages": error_messages[:10],
+                    "network_records": network_records,
                     "screenshot": screenshot_path,
                     "status": "ok",
                 }
@@ -695,6 +741,7 @@ class ResponseProbeWorker(QThread):
                     "captcha": "超时",
                     "url": self.url,
                     "error_messages": ["请求超时"],
+                    "network_records": [],
                     "screenshot": "",
                     "status": "timeout",
                 }
@@ -704,6 +751,7 @@ class ResponseProbeWorker(QThread):
                     "captcha": "错误",
                     "url": self.url,
                     "error_messages": [str(e)[:150]],
+                    "network_records": [],
                     "screenshot": "",
                     "status": "error",
                 }
@@ -714,8 +762,7 @@ class ResponseProbeWorker(QThread):
                     except Exception:
                         pass
 
-        # Should not reach here, but satisfy linter
-        return {"scenario": scenario_name, "status": "unknown", "error_messages": [], "url": self.url}
+        return {"scenario": scenario_name, "status": "unknown", "error_messages": [], "network_records": [], "url": self.url}
 
 
 class MainWindow(QMainWindow):
@@ -1133,7 +1180,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("响应包探测进行中...")
 
     def _on_probe_done(self, results: list):
-        """Display response probe comparison in the log."""
+        """Display response probe comparison in the log, including network-level diff."""
+        import json
+        import difflib
+        from urllib.parse import urlparse
+
         self.log("━" * 40)
         self.log("响应包探测完成，结果如下：")
 
@@ -1142,6 +1193,7 @@ class MainWindow(QMainWindow):
             "wrong_creds_correct_captcha": "场景2: 错误账号密码 + 正确验证码",
             "wrong_creds_no_captcha":      "场景: 错误账号密码（无验证码）",
         }
+
         for r in results:
             label = scenario_labels.get(r.get("scenario", ""), r.get("scenario", "未知场景"))
             self.log(f"\n▶ {label}")
@@ -1154,27 +1206,143 @@ class MainWindow(QMainWindow):
                     self.log(f"    • {e[:120]}")
             else:
                 self.log("  页面错误信息 : (未检测到)")
+
+            nets = r.get("network_records", [])
+            self.log(f"  捕获请求数 : {len(nets)}")
+            for rec in nets:
+                status  = rec.get("status", "?")
+                method  = rec.get("method", "?")
+                url     = rec.get("url", "")
+                loc     = rec.get("location", "")
+                loc_str = f"  → {loc}" if loc else ""
+                self.log(f"    [{method}] {status}{loc_str}  {url[:100]}")
+
             sc = r.get("screenshot", "")
             if sc:
                 self.log(f"  截图        : {sc}")
 
+        # ── Network diff (only when two scenarios are available) ──────────
         if len(results) == 2:
             r1, r2 = results[0], results[1]
+
+            # --- Classic page-text diff ---
             e1 = set(r1.get("error_messages", []))
             e2 = set(r2.get("error_messages", []))
             self.log("\n📊 场景对比分析:")
+
             if e1 != e2:
                 diff1 = e1 - e2
                 diff2 = e2 - e1
                 if diff1:
-                    self.log(f"  场景1 独有: {' | '.join(list(diff1)[:3])}")
+                    self.log(f"  场景1 独有页面错误: {' | '.join(list(diff1)[:3])}")
                 if diff2:
-                    self.log(f"  场景2 独有: {' | '.join(list(diff2)[:3])}")
-                self.log("  ✅ 两种场景响应不同，可区分验证码错误与密码错误")
+                    self.log(f"  场景2 独有页面错误: {' | '.join(list(diff2)[:3])}")
+                self.log("  ✅ 两种场景页面响应不同，可区分验证码错误与密码错误")
             else:
-                self.log("  ⚠ 两种场景响应相同，可能难以区分验证码与密码错误")
+                self.log("  ⚠ 两种场景页面错误信息相同")
+
             if r1.get("url") != r2.get("url"):
                 self.log(f"  URL 差异: 场景1 → {r1.get('url')} | 场景2 → {r2.get('url')}")
+
+            # --- Network-level diff ---
+            nets1: List[Dict] = r1.get("network_records", [])
+            nets2: List[Dict] = r2.get("network_records", [])
+
+            def _key(rec: Dict) -> str:
+                parsed = urlparse(rec.get("url", ""))
+                return f"{rec.get('method','?')} {parsed.path or rec.get('url','')}"
+
+            idx1 = {_key(rec): rec for rec in nets1}
+            idx2 = {_key(rec): rec for rec in nets2}
+
+            all_keys = sorted(set(idx1) | set(idx2))
+            if not all_keys:
+                self.log("\n  (无捕获到的网络请求，无法进行网络层 diff)")
+            else:
+                self.log("\n🔎 网络请求 Diff:")
+                has_diff = False
+                for k in all_keys:
+                    rec1 = idx1.get(k)
+                    rec2 = idx2.get(k)
+
+                    if rec1 is None:
+                        self.log(f"  ＋[仅场景2] {k}")
+                        has_diff = True
+                        continue
+                    if rec2 is None:
+                        self.log(f"  －[仅场景1] {k}")
+                        has_diff = True
+                        continue
+
+                    diffs_for_key = []
+
+                    # Status code
+                    if rec1.get("status") != rec2.get("status"):
+                        diffs_for_key.append(
+                            f"状态码: {rec1.get('status')} → {rec2.get('status')}"
+                        )
+
+                    # Location header (redirect)
+                    if rec1.get("location") != rec2.get("location"):
+                        diffs_for_key.append(
+                            f"Location: {rec1.get('location') or '(无)'} → {rec2.get('location') or '(无)'}"
+                        )
+
+                    # Response body diff
+                    body1 = rec1.get("body") or ""
+                    body2 = rec2.get("body") or ""
+                    if body1 != body2:
+                        ct = rec1.get("content_type", "")
+                        if "json" in ct:
+                            # JSON key-level diff
+                            try:
+                                j1 = json.loads(body1.rstrip("…"))
+                                j2 = json.loads(body2.rstrip("…"))
+                                changed_keys = [
+                                    f'"{kk}": {j1.get(kk)!r} → {j2.get(kk)!r}'
+                                    for kk in sorted(set(j1) | set(j2))
+                                    if j1.get(kk) != j2.get(kk)
+                                ]
+                                if changed_keys:
+                                    diffs_for_key.append(
+                                        "JSON diff: " + " | ".join(changed_keys[:5])
+                                    )
+                            except Exception:
+                                # Fallback: unified diff on lines
+                                ud = list(difflib.unified_diff(
+                                    body1.splitlines(), body2.splitlines(),
+                                    lineterm="", n=1
+                                ))[:12]
+                                if ud:
+                                    diffs_for_key.append("响应体变化 (unified diff):\n      " + "\n      ".join(ud))
+                        else:
+                            ud = list(difflib.unified_diff(
+                                body1.splitlines(), body2.splitlines(),
+                                lineterm="", n=1
+                            ))[:12]
+                            if ud:
+                                diffs_for_key.append("响应体变化:\n      " + "\n      ".join(ud))
+
+                    # Post-data diff (request body)
+                    pd1 = rec1.get("post_data") or ""
+                    pd2 = rec2.get("post_data") or ""
+                    if pd1 != pd2:
+                        diffs_for_key.append(
+                            f"请求体变化: {pd1[:80] or '(空)'} → {pd2[:80] or '(空)'}"
+                        )
+
+                    if diffs_for_key:
+                        self.log(f"  ≠ {k}")
+                        for d in diffs_for_key:
+                            for line in d.splitlines():
+                                self.log(f"      {line}")
+                        has_diff = True
+
+                if not has_diff:
+                    self.log("  (两场景网络请求/响应完全相同，服务端可能不区分)")
+                else:
+                    self.log("  ✅ 网络层存在差异，可用于自动区分响应类型")
+
         self.log("━" * 40)
         self.statusBar().showMessage("响应包探测完成")
 
