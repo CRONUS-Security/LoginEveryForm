@@ -16,3 +16,7 @@ data/
 
 # Python cache files
 __pycache__/
+
+# Build artifacts
+dist/
+build/LoginEveryForm/

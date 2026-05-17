@@ -1,0 +1,157 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Browser variant to build (leave empty to build all)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - chromium-only
+          - full
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}, ${{ matrix.variant }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        variant: [chromium-only, full]
+        exclude:
+          - variant: ${{ github.event.inputs.variant == 'chromium-only' && 'full' || '' }}
+          - variant: ${{ github.event.inputs.variant == 'full' && 'chromium-only' || '' }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Python setup
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # -----------------------------------------------------------------------
+      # 3. Install Python dependencies
+      # -----------------------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # -----------------------------------------------------------------------
+      # 4. Build single-file binary with PyInstaller
+      # -----------------------------------------------------------------------
+      - name: Build with PyInstaller
+        env:
+          BUILD_VARIANT: ${{ matrix.variant }}
+        run: |
+          python -m PyInstaller --clean --noconfirm build/LoginEveryForm.spec
+
+      # -----------------------------------------------------------------------
+      # 5. Determine asset name (version + platform + variant)
+      # -----------------------------------------------------------------------
+      - name: Determine asset name
+        id: asset
+        shell: python
+        run: |
+          import importlib.util, os, sys
+
+          spec = importlib.util.spec_from_file_location("m", "modules/__init__.py")
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          version = m.__version__
+
+          platform = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+          suffix = ".exe" if sys.platform == "win32" else ""
+          variant = "${{ matrix.variant }}"
+
+          src  = f"dist/LoginEveryForm-{variant}{suffix}"
+          name = f"LoginEveryForm-v{version}-{platform}-{variant}{suffix}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"src={src}\n")
+              f.write(f"name={name}\n")
+
+      # -----------------------------------------------------------------------
+      # 6. Rename binary to include version + platform in the filename
+      # -----------------------------------------------------------------------
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Move-Item "${{ steps.asset.outputs.src }}" "dist/${{ steps.asset.outputs.name }}"
+
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: mv "${{ steps.asset.outputs.src }}" "dist/${{ steps.asset.outputs.name }}"
+
+      # -----------------------------------------------------------------------
+      # 7. Upload artifact (for inspection / non-release runs)
+      # -----------------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.asset.outputs.name }}
+          path: dist/${{ steps.asset.outputs.name }}
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Release job — runs after all build jobs succeed, only on tag pushes
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "LoginEveryForm ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          generate_release_notes: true
+          body: |
+            ## LoginEveryForm ${{ github.ref_name }}
+
+            ### 下载
+
+            | 平台 | 仅 Chromium | 完整版 (Chromium + Firefox + WebKit) |
+            |---|---|---|
+            | Windows | `*-windows-chromium-only.exe` | `*-windows-full.exe` |
+            | Linux   | `*-linux-chromium-only`      | `*-linux-full`       |
+            | macOS   | `*-macos-chromium-only`      | `*-macos-full`       |
+
+            ### 使用说明
+            直接运行下载的可执行文件。**首次启动**时程序会自动下载对应的浏览器驱动，
+            后续运行无需重复下载。浏览器存储于 `~/.logineveryform/playwright-browsers/`。
+
+          files: release-assets/*

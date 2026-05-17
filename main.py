@@ -3,7 +3,20 @@ LoginEveryForm - Password Breach Verification Tool
 Main GUI Application using PySide6
 """
 
+# NOTE: env vars must be set before ANY playwright import.
 import sys
+import os
+import multiprocessing
+from pathlib import Path
+
+# Required for PyInstaller --onefile on Windows: prevents frozen subprocesses
+# from re-running the full application instead of acting as worker processes.
+if getattr(sys, "frozen", False):
+    multiprocessing.freeze_support()
+    # Single-file binary: store browsers in a persistent user-level directory.
+    _browsers_dir = Path.home() / ".logineveryform" / "playwright-browsers"
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_browsers_dir))
+
 import asyncio
 import random
 import logging
@@ -1847,6 +1860,11 @@ def main():
     """Main entry point"""
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # First-run check: install playwright browsers if not already present.
+    from modules.browser_setup import ensure_browsers_installed
+    if not ensure_browsers_installed():
+        sys.exit(1)
 
     window = MainWindow()
     window.show()

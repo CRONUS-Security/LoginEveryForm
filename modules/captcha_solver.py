@@ -16,7 +16,7 @@ except ImportError:
 try:
     import ddddocr
 except ImportError:
-    raise ImportError("Please install ddddocr package: pip install ddddocr")
+    ddddocr = None
 
 from .logger import get_logger
 
@@ -34,13 +34,18 @@ class CaptchaSolver:
         self.logger = get_logger()
         self.logger.info(f"Initializing captcha solver (GPU: {use_gpu})")
 
+        if ddddocr is None:
+            self.logger.warning("ddddocr not available - captcha solving will be disabled")
+            self.ocr = None
+            return
+
         try:
             # Initialize ddddocr with beta mode for better accuracy
             self.ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
             self.logger.success("Captcha solver initialized successfully")
         except Exception as e:
             self.logger.error(f"Failed to initialize captcha solver: {e}")
-            raise
+            self.ocr = None
 
     def solve_from_file(self, image_path: Union[str, Path]) -> Optional[str]:
         """
@@ -52,6 +57,10 @@ class CaptchaSolver:
         Returns:
             Recognized text or None if failed
         """
+        if self.ocr is None:
+            self.logger.warning("Captcha solver not available, skipping")
+            return None
+
         try:
             image_path = Path(image_path)
             if not image_path.exists():
@@ -79,6 +88,10 @@ class CaptchaSolver:
         Returns:
             Recognized text or None if failed
         """
+        if self.ocr is None:
+            self.logger.warning("Captcha solver not available, skipping")
+            return None
+
         try:
             result = self.ocr.classification(image_bytes)
             self.logger.debug(f"Captcha recognized from bytes: {result}")
@@ -98,6 +111,10 @@ class CaptchaSolver:
         Returns:
             Recognized text or None if failed
         """
+        if self.ocr is None:
+            self.logger.warning("Captcha solver not available, skipping")
+            return None
+
         try:
             # Remove data URI prefix if present
             if ',' in base64_string:

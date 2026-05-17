@@ -2,6 +2,7 @@
 Configuration Management
 """
 
+import sys
 from pathlib import Path
 from typing import Optional
 import modules
@@ -15,8 +16,8 @@ class Config:
     APP_VERSION = modules.__version__
     APP_AUTHOR = modules.__author__
 
-    # Directories
-    BASE_DIR = Path(__file__).parent
+    # Directories — sys._MEIPASS is set by PyInstaller in frozen builds
+    BASE_DIR = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent  # type: ignore[attr-defined]
     LOGS_DIR = BASE_DIR / "logs"
     SCREENSHOTS_DIR = BASE_DIR / "screenshots"
     DATA_DIR = BASE_DIR / "data"
