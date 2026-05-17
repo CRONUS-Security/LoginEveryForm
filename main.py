@@ -596,23 +596,64 @@ class ResponseProbeWorker(QThread):
             try:
                 page = await automation.context.new_page()
                 page.set_default_timeout(automation.timeout)
-                await page.goto(self.url, wait_until="domcontentloaded")
-                await page.wait_for_load_state("load", timeout=automation.timeout)
 
+                # Wrap selectors so Playwright targets only visible elements,
+                # avoiding hidden duplicates (e.g. input[type='text'][name*='account']
+                # may match both a visible and a hidden input).
+                def _vis(sel: str) -> str:
+                    return f"{sel}:visible"
+
+                self.probe_log.emit(f"  [步骤1] 导航到页面...")
+                await page.goto(self.url, wait_until="commit", timeout=automation.timeout)
+                for state in ("domcontentloaded", "load"):
+                    try:
+                        await page.wait_for_load_state(state, timeout=5000)
+                    except PlaywrightTimeout:
+                        self.probe_log.emit(f"  [步骤1] wait_for_load_state({state!r}) 超时，继续")
+                        break
+
+                self.probe_log.emit(f"  [步骤2] 等待用户名框可见...")
                 if self.username_selector:
-                    await page.fill(self.username_selector, self._PROBE_USERNAME)
+                    try:
+                        await page.wait_for_selector(
+                            _vis(self.username_selector), timeout=10000
+                        )
+                    except PlaywrightTimeout:
+                        self.probe_log.emit("  [步骤2] 用户名框等待超时，尝试继续...")
+                    await page.locator(_vis(self.username_selector)).first.fill(
+                        self._PROBE_USERNAME, timeout=10000
+                    )
                     await page.wait_for_timeout(200)
+                self.probe_log.emit(f"  [步骤3] 等待密码框可见...")
                 if self.password_selector:
-                    await page.fill(self.password_selector, self._PROBE_PASSWORD)
+                    try:
+                        await page.wait_for_selector(
+                            _vis(self.password_selector), timeout=10000
+                        )
+                    except PlaywrightTimeout:
+                        self.probe_log.emit("  [步骤3] 密码框等待超时，尝试继续...")
+                    await page.locator(_vis(self.password_selector)).first.fill(
+                        self._PROBE_PASSWORD, timeout=10000
+                    )
                     await page.wait_for_timeout(200)
 
                 captcha_status = "N/A"
                 if self.captcha_selector:
                     if use_wrong_captcha:
-                        await page.fill(self.captcha_selector, self._WRONG_CAPTCHA)
+                        self.probe_log.emit(f"  [步骤4] 填写错误验证码...")
+                        try:
+                            await page.wait_for_selector(
+                                _vis(self.captcha_selector), timeout=10000
+                            )
+                        except PlaywrightTimeout:
+                            self.probe_log.emit("  [步骤4] 验证码框等待超时，尝试继续...")
+                        await page.locator(_vis(self.captcha_selector)).first.fill(
+                            self._WRONG_CAPTCHA, timeout=10000
+                        )
                         captcha_status = f"故意错误 ({self._WRONG_CAPTCHA})"
                         await page.wait_for_timeout(200)
                     else:
+                        self.probe_log.emit(f"  [步骤4] 识别验证码...")
                         captcha_text = await automation.solve_captcha(
                             page, self.captcha_image_selector or None
                         )
@@ -634,7 +675,9 @@ class ResponseProbeWorker(QThread):
                                 "screenshot": "",
                                 "status": "captcha_failed",
                             }
-                        await page.fill(self.captcha_selector, captcha_text)
+                        await page.locator(_vis(self.captcha_selector)).first.fill(
+                            captcha_text, timeout=10000
+                        )
                         captcha_status = f"已识别 ({captcha_text})"
                         await page.wait_for_timeout(200)
 
@@ -680,12 +723,14 @@ class ResponseProbeWorker(QThread):
                 page.on("response", _on_response)
                 # ─────────────────────────────────────────────────────────────
 
+                self.probe_log.emit(f"  [步骤5] 提交表单...")
                 if self.submit_selector:
                     await page.click(self.submit_selector)
                 elif self.password_selector:
                     await page.press(self.password_selector, "Enter")
 
                 await page.wait_for_timeout(3000)
+                self.probe_log.emit(f"  [步骤6] 收集页面信息...")
 
                 page.remove_listener("response", _on_response)
 
@@ -731,7 +776,8 @@ class ResponseProbeWorker(QThread):
                     "status": "ok",
                 }
 
-            except PlaywrightTimeout:
+            except PlaywrightTimeout as e:
+                self.probe_log.emit(f"  超时详情: {str(e)[:120]}")
                 if attempt < MAX_RETRIES - 1:
                     self.probe_log.emit(f"  超时，重试 ({attempt + 2}/{MAX_RETRIES})...")
                     await asyncio.sleep(2)

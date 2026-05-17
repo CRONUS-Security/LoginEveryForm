@@ -102,12 +102,19 @@ async def _get_login_container_scope(page: Page, scopes: List[str], logger=None)
 
 
 async def _query_in_scope(page: Page, scope: str, selector: str):
-    """在 scope 内查找元素；scope 为空则在整页查找。"""
+    """在 scope 内查找**可见**元素；scope 为空则在整页查找。
+    只返回 is_visible() 为 True 的元素，避免匹配到隐藏字段后
+    wait_for_selector（默认 state='visible'）超时。
+    """
     try:
         if scope:
             full = f"{scope} >> {selector}"
-            return await page.query_selector(full)
-        return await page.query_selector(selector)
+            el = await page.query_selector(full)
+        else:
+            el = await page.query_selector(selector)
+        if el and await el.is_visible():
+            return el
+        return None
     except Exception:
         return None
 
@@ -151,7 +158,7 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
         if not selectors["password"]:
             for pattern in get_password_patterns():
                 el = await page.query_selector(pattern)
-                if el:
+                if el and await el.is_visible():
                     selectors["password"] = pattern
                     _dbg(f"[detect_login_form] password ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
@@ -169,7 +176,7 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
         if not selectors["username"]:
             for pattern in get_username_patterns():
                 el = await page.query_selector(pattern)
-                if el:
+                if el and await el.is_visible():
                     selectors["username"] = pattern
                     _dbg(f"[detect_login_form] username ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
@@ -192,7 +199,7 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
         if not selectors["captcha"]:
             for pattern in get_captcha_patterns():
                 el = await page.query_selector(pattern)
-                if el:
+                if el and await el.is_visible():
                     if selectors["username"] and pattern == selectors["username"]:
                         continue
                     selectors["captcha"] = pattern
@@ -212,7 +219,7 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
         if not selectors["submit"]:
             for pattern in get_submit_patterns():
                 el = await page.query_selector(pattern)
-                if el:
+                if el and await el.is_visible():
                     selectors["submit"] = pattern
                     _dbg(f"[detect_login_form] submit ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
@@ -230,7 +237,7 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
         if not selectors["captcha_image"]:
             for pattern in get_captcha_image_patterns():
                 el = await page.query_selector(pattern)
-                if el:
+                if el and await el.is_visible():
                     selectors["captcha_image"] = pattern
                     _dbg(f"[detect_login_form] captcha_image ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break

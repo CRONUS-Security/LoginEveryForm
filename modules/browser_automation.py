@@ -291,7 +291,10 @@ class BrowserAutomation:
             # Navigate to login page
             self.logger.info(f"Navigating to: {url}")
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_load_state("load", timeout=self.timeout)
+            try:
+                await page.wait_for_load_state("load", timeout=self.timeout)
+            except PlaywrightTimeout:
+                pass  # DOM already loaded; some resources may still be pending
 
             # Auto-detect form elements if not provided
             if not username_selector or not password_selector:
