@@ -70,6 +70,29 @@ class LoginWorker(QThread):
         self.session_isolation = session_isolation
         self._is_running = True
 
+    async def _attempt_with_retry(
+        self,
+        automation: "BrowserAutomation",
+        credential: "Credential",
+        idx: int,
+        total: int,
+        **kwargs,
+    ) -> "LoginResult":
+        """Attempt login up to 3 times, retrying on CAPTCHA_REQUIRED or TIMEOUT."""
+        MAX_RETRIES = 3
+        result = None
+        for attempt in range(MAX_RETRIES):
+            result = await automation.attempt_login(credential=credential, **kwargs)
+            if result.status not in (LoginStatus.CAPTCHA_REQUIRED, LoginStatus.TIMEOUT):
+                return result
+            if attempt < MAX_RETRIES - 1:
+                self.progress.emit(
+                    idx, total,
+                    f"[重试 {attempt + 2}/{MAX_RETRIES}] {credential.username}: {result.status.value}",
+                )
+                await asyncio.sleep(2.0)
+        return result  # return last result after exhausting retries
+
     def run(self):
         """Run the login automation"""
         try:
@@ -106,9 +129,9 @@ class LoginWorker(QThread):
                     per_attempt_automation = None
                     try:
                         per_attempt_automation = await _make_automation()
-                        result = await per_attempt_automation.attempt_login(
+                        result = await self._attempt_with_retry(
+                            per_attempt_automation, credential, idx, total,
                             url=self.url,
-                            credential=credential,
                             username_selector=self.username_selector,
                             password_selector=self.password_selector,
                             captcha_selector=self.captcha_selector,
@@ -140,9 +163,9 @@ class LoginWorker(QThread):
 
                     self.progress.emit(idx, total, f"Testing: {credential.username}")
 
-                    result = await automation.attempt_login(
+                    result = await self._attempt_with_retry(
+                        automation, credential, idx, total,
                         url=self.url,
-                        credential=credential,
                         username_selector=self.username_selector,
                         password_selector=self.password_selector,
                         captcha_selector=self.captcha_selector,
@@ -178,16 +201,27 @@ class LoginWorker(QThread):
 
 
 class CheckFormWorker(QThread):
-    """Worker thread: open browser, detect login form elements, emit CSS selectors to GUI."""
+    """Worker thread: open browser, detect login form elements, emit CSS selectors to GUI.
 
-    detected = Signal(object)  # Dict[str, Optional[str]]: username, password, captcha, submit
+    Also validates any pre-filled selectors by querying them on the live page.
+    Emits: {"detected": Dict[str, str|None], "validation": Dict[str, bool]}
+    """
+
+    detected = Signal(object)
     error = Signal(str)
 
-    def __init__(self, url: str, browser_type: str, headless: bool):
+    def __init__(
+        self,
+        url: str,
+        browser_type: str,
+        headless: bool,
+        existing_selectors: Optional[Dict[str, str]] = None,
+    ):
         super().__init__()
         self.url = url.strip()
         self.browser_type = browser_type
         self.headless = headless
+        self.existing_selectors = existing_selectors or {}
 
     def run(self):
         try:
@@ -212,9 +246,19 @@ class CheckFormWorker(QThread):
             await page.wait_for_load_state("load", timeout=automation.timeout)
 
             selectors = await automation.detect_login_form(page)
-            await page.close()
 
-            self.detected.emit(selectors)
+            # Validate any pre-filled selectors against the live page
+            validation: Dict[str, bool] = {}
+            for key, selector in self.existing_selectors.items():
+                if selector:
+                    try:
+                        el = await page.query_selector(selector)
+                        validation[key] = el is not None
+                    except Exception:
+                        validation[key] = False
+
+            await page.close()
+            self.detected.emit({"detected": selectors, "validation": validation})
         except Exception as e:
             import traceback
             self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
@@ -450,6 +494,230 @@ class GuidedPickerWorker(QThread):
                 await automation.stop()
 
 
+class ResponseProbeWorker(QThread):
+    """Worker thread: probe the login form with two scenarios to distinguish server responses.
+
+    Scenario 1 (captcha present): wrong credentials + deliberately wrong captcha
+    Scenario 2 (captcha present): wrong credentials + correctly solved captcha
+    Scenario   (no captcha):      wrong credentials only
+
+    Retries automatically on timeout or failed captcha recognition.
+    """
+
+    probe_log = Signal(str)       # incremental log messages
+    probe_done = Signal(list)     # List[Dict] – one dict per scenario
+    error = Signal(str)
+
+    _PROBE_USERNAME = "probe_invalid_9x7k2@test.invalid"
+    _PROBE_PASSWORD = "Probe!Invalid_p4ss9x7k2"
+    _WRONG_CAPTCHA = "XXXXX"
+
+    def __init__(
+        self,
+        url: str,
+        browser_type: str,
+        headless: bool,
+        username_selector: str,
+        password_selector: str,
+        captcha_selector: str,
+        captcha_image_selector: str,
+        submit_selector: str,
+    ):
+        super().__init__()
+        self.url = url
+        self.browser_type = browser_type
+        self.headless = headless
+        self.username_selector = username_selector
+        self.password_selector = password_selector
+        self.captcha_selector = captcha_selector
+        self.captcha_image_selector = captcha_image_selector
+        self.submit_selector = submit_selector
+
+    def run(self):
+        try:
+            asyncio.run(self._async_run())
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+    async def _async_run(self):
+        from playwright.async_api import TimeoutError as PlaywrightTimeout  # local import
+        automation = None
+        try:
+            browser_type_enum = BrowserType[self.browser_type.upper()]
+            automation = BrowserAutomation(
+                browser_type=browser_type_enum,
+                headless=self.headless,
+                screenshot_dir=str(Config.SCREENSHOTS_DIR),
+            )
+            await automation.start()
+
+            results: List[Dict] = []
+
+            if self.captcha_selector:
+                self.probe_log.emit("▶ 场景1: 错误账号密码 + 故意错误验证码...")
+                r1 = await self._probe_scenario(
+                    automation, PlaywrightTimeout,
+                    "wrong_creds_wrong_captcha", use_wrong_captcha=True,
+                )
+                results.append(r1)
+                await asyncio.sleep(1.5)
+
+                self.probe_log.emit("▶ 场景2: 错误账号密码 + 正确验证码...")
+                r2 = await self._probe_scenario(
+                    automation, PlaywrightTimeout,
+                    "wrong_creds_correct_captcha", use_wrong_captcha=False,
+                )
+                results.append(r2)
+            else:
+                self.probe_log.emit("▶ 场景: 错误账号密码（无验证码）...")
+                r1 = await self._probe_scenario(
+                    automation, PlaywrightTimeout,
+                    "wrong_creds_no_captcha", use_wrong_captcha=False,
+                )
+                results.append(r1)
+
+            self.probe_done.emit(results)
+
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+        finally:
+            if automation:
+                await automation.stop()
+
+    async def _probe_scenario(
+        self, automation, PlaywrightTimeout, scenario_name: str, use_wrong_captcha: bool
+    ) -> Dict:
+        import time as _time
+        MAX_RETRIES = 3
+        for attempt in range(MAX_RETRIES):
+            page = None
+            try:
+                page = await automation.context.new_page()
+                page.set_default_timeout(automation.timeout)
+                await page.goto(self.url, wait_until="domcontentloaded")
+                await page.wait_for_load_state("load", timeout=automation.timeout)
+
+                if self.username_selector:
+                    await page.fill(self.username_selector, self._PROBE_USERNAME)
+                    await page.wait_for_timeout(200)
+                if self.password_selector:
+                    await page.fill(self.password_selector, self._PROBE_PASSWORD)
+                    await page.wait_for_timeout(200)
+
+                captcha_status = "N/A"
+                if self.captcha_selector:
+                    if use_wrong_captcha:
+                        await page.fill(self.captcha_selector, self._WRONG_CAPTCHA)
+                        captcha_status = f"故意错误 ({self._WRONG_CAPTCHA})"
+                        await page.wait_for_timeout(200)
+                    else:
+                        captcha_text = await automation.solve_captcha(
+                            page, self.captcha_image_selector or None
+                        )
+                        if not captcha_text:
+                            await page.close()
+                            page = None
+                            if attempt < MAX_RETRIES - 1:
+                                self.probe_log.emit(
+                                    f"  验证码识别失败，重试 ({attempt + 2}/{MAX_RETRIES})..."
+                                )
+                                await asyncio.sleep(1.5)
+                                continue
+                            return {
+                                "scenario": scenario_name,
+                                "captcha": "识别失败",
+                                "url": self.url,
+                                "error_messages": ["验证码识别失败，无法完成场景探测"],
+                                "screenshot": "",
+                                "status": "captcha_failed",
+                            }
+                        await page.fill(self.captcha_selector, captcha_text)
+                        captcha_status = f"已识别 ({captcha_text})"
+                        await page.wait_for_timeout(200)
+
+                if self.submit_selector:
+                    await page.click(self.submit_selector)
+                elif self.password_selector:
+                    await page.press(self.password_selector, "Enter")
+
+                await page.wait_for_timeout(3000)
+
+                current_url = page.url
+                error_messages: List[str] = []
+                seen: set = set()
+                for sel in [
+                    ".error", ".alert-error", ".alert-danger", ".alert",
+                    "#error", "[class*='error']", "[class*='alert']",
+                    "[class*='tip']", "[class*='msg']", "[class*='message']",
+                    "[class*='warn']",
+                ]:
+                    try:
+                        for el in await page.query_selector_all(sel):
+                            try:
+                                txt = (await el.inner_text()).strip()
+                                if txt and txt not in seen and len(txt) < 300:
+                                    seen.add(txt)
+                                    error_messages.append(txt)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                screenshot_path = ""
+                try:
+                    screenshot_path = str(
+                        Config.SCREENSHOTS_DIR / f"probe_{scenario_name}_{int(_time.time())}.png"
+                    )
+                    await page.screenshot(path=screenshot_path)
+                except Exception:
+                    screenshot_path = ""
+
+                await page.close()
+                page = None
+                return {
+                    "scenario": scenario_name,
+                    "captcha": captcha_status,
+                    "url": current_url,
+                    "error_messages": error_messages[:10],
+                    "screenshot": screenshot_path,
+                    "status": "ok",
+                }
+
+            except PlaywrightTimeout:
+                if attempt < MAX_RETRIES - 1:
+                    self.probe_log.emit(f"  超时，重试 ({attempt + 2}/{MAX_RETRIES})...")
+                    await asyncio.sleep(2)
+                    continue
+                return {
+                    "scenario": scenario_name,
+                    "captcha": "超时",
+                    "url": self.url,
+                    "error_messages": ["请求超时"],
+                    "screenshot": "",
+                    "status": "timeout",
+                }
+            except Exception as e:
+                return {
+                    "scenario": scenario_name,
+                    "captcha": "错误",
+                    "url": self.url,
+                    "error_messages": [str(e)[:150]],
+                    "screenshot": "",
+                    "status": "error",
+                }
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+        # Should not reach here, but satisfy linter
+        return {"scenario": scenario_name, "status": "unknown", "error_messages": [], "url": self.url}
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
 
@@ -467,6 +735,8 @@ class MainWindow(QMainWindow):
         self.results: List[LoginResult] = []
 
         self._guided_picker_worker: Optional[GuidedPickerWorker] = None
+        self._response_probe_worker = None        # ResponseProbeWorker (defined after MainWindow)
+        self._field_statuses: Dict[str, str] = {} # field_key -> "green"/"red"/"yellow"/"none"
 
         self.init_ui()
         self.logger.info("Application started")
@@ -691,19 +961,39 @@ class MainWindow(QMainWindow):
         )
         self._pick_all_btn.clicked.connect(lambda: self._start_guided_picker())
         pick_all_layout.addWidget(self._pick_all_btn)
+
+        self._reset_all_btn = QPushButton("↺ Reset All")
+        self._reset_all_btn.setToolTip("Clear all selector inputs and reset background colours.")
+        self._reset_all_btn.clicked.connect(self._reset_all_selectors)
+        pick_all_layout.addWidget(self._reset_all_btn)
+
         selector_layout.addLayout(pick_all_layout)
 
         selector_group.setLayout(selector_layout)
         layout.addWidget(selector_group)
 
         # Control Buttons
-        control_layout = QHBoxLayout()
+        # Row 1: Check + its companion checkbox
+        check_layout = QHBoxLayout()
         self.check_button = QPushButton("Check")
         self.check_button.clicked.connect(self.check_form)
         self.check_button.setStyleSheet("QPushButton { background-color: #2196F3; color: white; padding: 10px; font-weight: bold; }")
         self.check_button.setToolTip("Only URL needed (no credentials). Open browser, detect login form controls, and fill CSS selectors above.")
-        control_layout.addWidget(self.check_button)
+        check_layout.addWidget(self.check_button, 1)
 
+        self.auto_response_check = QCheckBox("Auto-detect response patterns")
+        self.auto_response_check.setChecked(True)
+        self.auto_response_check.setToolTip(
+            "After all fields turn green, automatically send two probe requests:\n"
+            "  Scenario 1: wrong credentials + deliberately wrong captcha\n"
+            "  Scenario 2: wrong credentials + correctly solved captcha\n"
+            "Compares server responses to distinguish captcha errors from credential errors."
+        )
+        check_layout.addWidget(self.auto_response_check, 1)
+        layout.addLayout(check_layout)
+
+        # Row 2: Start / Stop
+        control_layout = QHBoxLayout()
         self.start_button = QPushButton("Start Verification")
         self.start_button.clicked.connect(self.start_verification)
         self.start_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; padding: 10px; font-weight: bold; }")
@@ -769,6 +1059,132 @@ class MainWindow(QMainWindow):
         layout.addWidget(export_button)
 
         return widget
+
+    # ─── Field colour helpers ────────────────────────────────────────────────
+
+    _FIELD_COLORS = {
+        "green":  "QLineEdit { background-color: #c8e6c9; }",
+        "red":    "QLineEdit { background-color: #ffcdd2; }",
+        "yellow": "QLineEdit { background-color: #fff9c4; }",
+        "none":   "",
+    }
+
+    def _set_field_color(self, field_key: str, status: str):
+        """Set the background colour of a selector input widget."""
+        inputs_map = self._field_inputs_map()
+        if field_key in inputs_map:
+            inputs_map[field_key].setStyleSheet(self._FIELD_COLORS.get(status, ""))
+            self._field_statuses[field_key] = status
+
+    def _reset_all_selectors(self):
+        """Clear all selector inputs and reset their background colours."""
+        for key, widget in self._field_inputs_map().items():
+            widget.clear()
+            widget.setStyleSheet("")
+        self._field_statuses.clear()
+        self.log("All selectors reset.")
+        self.statusBar().showMessage("All selectors cleared.")
+
+    def _check_all_required_green(self) -> bool:
+        """Return True when username, password, submit (and captcha if enabled) are all green."""
+        required = ["username", "password", "submit"]
+        if self.enable_captcha_check.isChecked():
+            required.append("captcha")
+        inputs_map = self._field_inputs_map()
+        for key in required:
+            if self._field_statuses.get(key) != "green":
+                return False
+            widget = inputs_map.get(key)
+            if widget is None or not widget.text().strip():
+                return False
+        return True
+
+    # ─── Response probe ──────────────────────────────────────────────────────
+
+    def _start_response_probe(self):
+        """Start the ResponseProbeWorker to distinguish server responses."""
+        if self._response_probe_worker is not None:
+            self.log("响应包探测已在进行中，跳过...")
+            return
+
+        url = self.url_input.text().strip()
+        if not url:
+            return
+
+        selectors = {k: w.text().strip() for k, w in self._field_inputs_map().items()}
+
+        self._response_probe_worker = ResponseProbeWorker(
+            url=url,
+            browser_type=self.browser_combo.currentText(),
+            headless=self.headless_check.isChecked(),
+            username_selector=selectors.get("username", ""),
+            password_selector=selectors.get("password", ""),
+            captcha_selector=selectors.get("captcha", ""),
+            captcha_image_selector=selectors.get("captcha_image", ""),
+            submit_selector=selectors.get("submit", ""),
+        )
+        self._response_probe_worker.probe_log.connect(self.log)
+        self._response_probe_worker.probe_done.connect(self._on_probe_done)
+        self._response_probe_worker.error.connect(self._on_probe_error)
+        self._response_probe_worker.finished.connect(self._on_probe_finished)
+        self._response_probe_worker.start()
+
+        self.check_button.setEnabled(False)
+        self.statusBar().showMessage("响应包探测进行中...")
+
+    def _on_probe_done(self, results: list):
+        """Display response probe comparison in the log."""
+        self.log("━" * 40)
+        self.log("响应包探测完成，结果如下：")
+
+        scenario_labels = {
+            "wrong_creds_wrong_captcha":   "场景1: 错误账号密码 + 故意错误验证码",
+            "wrong_creds_correct_captcha": "场景2: 错误账号密码 + 正确验证码",
+            "wrong_creds_no_captcha":      "场景: 错误账号密码（无验证码）",
+        }
+        for r in results:
+            label = scenario_labels.get(r.get("scenario", ""), r.get("scenario", "未知场景"))
+            self.log(f"\n▶ {label}")
+            self.log(f"  验证码状态 : {r.get('captcha', 'N/A')}")
+            self.log(f"  最终 URL   : {r.get('url', 'N/A')}")
+            errs = r.get("error_messages", [])
+            if errs:
+                self.log("  页面错误信息 :")
+                for e in errs:
+                    self.log(f"    • {e[:120]}")
+            else:
+                self.log("  页面错误信息 : (未检测到)")
+            sc = r.get("screenshot", "")
+            if sc:
+                self.log(f"  截图        : {sc}")
+
+        if len(results) == 2:
+            r1, r2 = results[0], results[1]
+            e1 = set(r1.get("error_messages", []))
+            e2 = set(r2.get("error_messages", []))
+            self.log("\n📊 场景对比分析:")
+            if e1 != e2:
+                diff1 = e1 - e2
+                diff2 = e2 - e1
+                if diff1:
+                    self.log(f"  场景1 独有: {' | '.join(list(diff1)[:3])}")
+                if diff2:
+                    self.log(f"  场景2 独有: {' | '.join(list(diff2)[:3])}")
+                self.log("  ✅ 两种场景响应不同，可区分验证码错误与密码错误")
+            else:
+                self.log("  ⚠ 两种场景响应相同，可能难以区分验证码与密码错误")
+            if r1.get("url") != r2.get("url"):
+                self.log(f"  URL 差异: 场景1 → {r1.get('url')} | 场景2 → {r2.get('url')}")
+        self.log("━" * 40)
+        self.statusBar().showMessage("响应包探测完成")
+
+    def _on_probe_error(self, error_msg: str):
+        self.log(f"响应包探测错误: {error_msg}")
+        self.statusBar().showMessage("响应包探测失败")
+
+    def _on_probe_finished(self):
+        self._response_probe_worker = None
+        self.check_button.setEnabled(True)
 
     def browse_file(self):
         """Browse for Data Table file"""
@@ -904,64 +1320,87 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Detecting login form...")
         self.log("Check: Opening browser and detecting form elements...")
 
+        # Snapshot current selector values so the worker can validate pre-filled selectors
+        existing_selectors = {
+            key: widget.text().strip()
+            for key, widget in self._field_inputs_map().items()
+        }
+
         self.check_worker = CheckFormWorker(
             url=url,
             browser_type=self.browser_combo.currentText(),
             headless=self.headless_check.isChecked(),
+            existing_selectors=existing_selectors,
         )
         self.check_worker.detected.connect(self._on_check_detected)
         self.check_worker.error.connect(self._on_check_error)
         self.check_worker.finished.connect(self._on_check_finished)
         self.check_worker.start()
 
-    def _on_check_detected(self, selectors: Dict[str, Any]):
-        """Fill GUI selector inputs with detected CSS expressions."""
-        username = selectors.get("username") or ""
-        password = selectors.get("password") or ""
-        captcha = selectors.get("captcha") or ""
-        captcha_image = selectors.get("captcha_image") or ""
-        submit = selectors.get("submit") or ""
+    def _on_check_detected(self, data: Dict[str, Any]):
+        """Apply colour feedback to each selector field and fill auto-detected values."""
+        detected: Dict[str, Any] = data.get("detected", {})
+        validation: Dict[str, bool] = data.get("validation", {})
 
-        self.username_selector_input.setText(username)
-        self.password_selector_input.setText(password)
-        self.captcha_selector_input.setText(captcha)
-        self.captcha_image_selector_input.setText(captcha_image)
-        self.submit_selector_input.setText(submit)
+        inputs_map = self._field_inputs_map()
 
-        self.log("Check: Detected selectors filled.")
-        self.log(f"  Username:      {username or '(none)'}")
-        self.log(f"  Password:      {password or '(none)'}")
-        self.log(f"  Captcha:       {captcha or '(none)'}")
-        self.log(f"  Captcha Image: {captcha_image or '(none)'}")
-        self.log(f"  Submit:        {submit or '(none)'}")
-        self.statusBar().showMessage("Detection complete. Selectors filled.")
+        for field_key, input_widget in inputs_map.items():
+            existing_val = input_widget.text().strip()
+            detected_sel = detected.get(field_key) or ""
 
-        # Prompt guided picker when required fields could not be located
-        missing = []
-        if not username:
-            missing.append("username")
-        if not password:
-            missing.append("password")
-        if not submit:
-            missing.append("submit")
+            if existing_val:
+                # Field already has a value — validate it against the live page
+                if validation.get(field_key, False):
+                    self._set_field_color(field_key, "green")
+                else:
+                    self._set_field_color(field_key, "red")
+            else:
+                # Field is empty
+                if detected_sel:
+                    input_widget.setText(detected_sel)
+                    self._set_field_color(field_key, "green")
+                else:
+                    self._set_field_color(field_key, "yellow")
 
-        if missing:
-            field_labels = {
-                "username": "Username Field",
-                "password": "Password Field",
-                "submit": "Submit Button",
-            }
-            missing_labels = ", ".join(field_labels[k] for k in missing)
-            reply = QMessageBox.question(
-                self,
-                "Auto-Detection Incomplete",
-                f"Could not auto-detect the following required elements:\n  {missing_labels}\n\n"
-                "Launch the interactive element picker to select them manually?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if reply == QMessageBox.Yes:
-                self._start_guided_picker(missing)
+        # Log summary
+        self.log("Check: 字段识别结果：")
+        for field_key in inputs_map:
+            val = inputs_map[field_key].text().strip() or "(none)"
+            status = self._field_statuses.get(field_key, "none")
+            icon = {"green": "✅", "red": "❌", "yellow": "⚠", "none": "—"}.get(status, "")
+            self.log(f"  {icon} {field_key:16s}: {val}")
+
+        self.statusBar().showMessage("Detection complete.")
+
+        # Check if we can auto-start response probe
+        if self._check_all_required_green():
+            if self.auto_response_check.isChecked():
+                self.log("━" * 40)
+                self.log("所有必填字段已验证（全绿），自动启动响应包探测...")
+                self._start_response_probe()
+        else:
+            # Prompt guided picker for fields that are red or yellow
+            missing = [
+                k for k in ["username", "password", "submit"]
+                if self._field_statuses.get(k) in ("red", "yellow")
+            ]
+            if missing:
+                field_labels = {
+                    "username": "Username Field",
+                    "password": "Password Field",
+                    "submit": "Submit Button",
+                }
+                missing_labels = ", ".join(field_labels[k] for k in missing)
+                reply = QMessageBox.question(
+                    self,
+                    "Auto-Detection Incomplete",
+                    f"Could not auto-detect the following required elements:\n  {missing_labels}\n\n"
+                    "Launch the interactive element picker to select them manually?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if reply == QMessageBox.Yes:
+                    self._start_guided_picker(missing)
 
     def _on_check_error(self, error_msg: str):
         """Handle check worker error."""
@@ -970,8 +1409,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Check failed")
 
     def _on_check_finished(self):
-        """Re-enable Check button when worker finishes."""
-        self.check_button.setEnabled(True)
+        """Re-enable Check button when worker finishes (unless response probe is still running)."""
+        if self._response_probe_worker is None:
+            self.check_button.setEnabled(True)
         if self.check_worker and self.check_worker.isFinished():
             self.check_worker = None
 
