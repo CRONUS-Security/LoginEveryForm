@@ -8,6 +8,7 @@
 - submit.py     提交按钮
 - captcha_image.py  验证码图片
 """
+import time
 from typing import Dict, Optional, List
 
 from playwright.async_api import Page
@@ -61,31 +62,41 @@ def get_captcha_image_patterns() -> List[str]:
     return list(CAPTCHA_IMAGE_PATTERNS)
 
 
-async def wait_for_login_form(page: Page, timeout_ms: int = 5000) -> None:
+async def wait_for_login_form(page: Page, timeout_ms: int = 5000, logger=None) -> None:
     """
-    等待登录表单出现在 DOM 中（避免 load 后 SPA 尚未渲染导致检测为空）。
-    先尝试等待容器 scope，否则等待 input[type='password']。
+    等待页面 DOM 加载完成（domcontentloaded）。
+    容器 scope 检测由后续的 detect_login_form 负责，此处不再轮询选择器。
     """
-    for scope in get_container_scopes():
-        try:
-            await page.wait_for_selector(scope, state="attached", timeout=timeout_ms)
-            return
-        except Exception:
-            continue
+    def _dbg(msg: str):
+        if logger:
+            logger.debug(msg)
+
+    import time as _time
+    t0 = _time.perf_counter()
+    _dbg("[wait_for_login_form] 等待 domcontentloaded...")
     try:
-        await page.wait_for_selector("input[type='password']", state="attached", timeout=timeout_ms)
-    except Exception:
-        pass
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        _dbg(f"[wait_for_login_form] ✅ domcontentloaded（{(_time.perf_counter()-t0)*1000:.0f}ms）")
+    except Exception as e:
+        _dbg(f"[wait_for_login_form] ⚠ domcontentloaded 超时，继续检测: {e!s:.80}")
 
 
-async def _get_login_container_scope(page: Page, scopes: List[str]) -> str:
+async def _get_login_container_scope(page: Page, scopes: List[str], logger=None) -> str:
     """在页面中查找第一个匹配的登录容器 scope，未找到返回空字符串。"""
     for scope in scopes:
         try:
+            t0 = time.perf_counter()
             el = await page.query_selector(scope)
+            elapsed = (time.perf_counter() - t0) * 1000
             if el:
+                if logger:
+                    logger.debug(f"[container_scope] ✅ 命中: {scope!r}（{elapsed:.0f}ms）")
                 return scope
-        except Exception:
+            if logger:
+                logger.debug(f"[container_scope] ✗ 无元素: {scope!r}（{elapsed:.0f}ms）")
+        except Exception as e:
+            if logger:
+                logger.debug(f"[container_scope] ✗ 异常: {scope!r}: {e!s:.80}")
             continue
     return ""
 
@@ -114,41 +125,59 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
         "submit": None,
     }
 
+    def _dbg(msg: str):
+        logger.debug(msg)
+
     try:
+        t_total = time.perf_counter()
         scopes = get_container_scopes()
-        scope = await _get_login_container_scope(page, scopes)
+        _dbg(f"[detect_login_form] 开始，共 {len(scopes)} 个容器 scope，"
+             f"password:{len(get_password_patterns())} username:{len(get_username_patterns())} "
+             f"captcha:{len(get_captcha_patterns())} submit:{len(get_submit_patterns())} "
+             f"captcha_img:{len(get_captcha_image_patterns())} 个规则")
+
+        t0 = time.perf_counter()
+        scope = await _get_login_container_scope(page, scopes, logger)
+        _dbg(f"[detect_login_form] 容器 scope 确定: {scope!r}（{(time.perf_counter()-t0)*1000:.0f}ms）")
 
         # ----- 密码 -----
+        t0 = time.perf_counter()
         for pattern in get_password_patterns():
             el = await _query_in_scope(page, scope, pattern)
             if el:
                 selectors["password"] = f"{scope} >> {pattern}" if scope else pattern
-                logger.debug(f"Password field found: {selectors['password']}")
+                _dbg(f"[detect_login_form] password ✅ {selectors['password']}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                 break
         if not selectors["password"]:
             for pattern in get_password_patterns():
                 el = await page.query_selector(pattern)
                 if el:
                     selectors["password"] = pattern
-                    logger.debug(f"Password field (page fallback): {pattern}")
+                    _dbg(f"[detect_login_form] password ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
+        if not selectors["password"]:
+            _dbg(f"[detect_login_form] password ✗ 未找到（{(time.perf_counter()-t0)*1000:.0f}ms）")
 
         # ----- 用户名 -----
+        t0 = time.perf_counter()
         for pattern in get_username_patterns():
             el = await _query_in_scope(page, scope, pattern)
             if el:
                 selectors["username"] = f"{scope} >> {pattern}" if scope else pattern
-                logger.debug(f"Username field found: {selectors['username']}")
+                _dbg(f"[detect_login_form] username ✅ {selectors['username']}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                 break
         if not selectors["username"]:
             for pattern in get_username_patterns():
                 el = await page.query_selector(pattern)
                 if el:
                     selectors["username"] = pattern
-                    logger.debug(f"Username field (page fallback): {pattern}")
+                    _dbg(f"[detect_login_form] username ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
+        if not selectors["username"]:
+            _dbg(f"[detect_login_form] username ✗ 未找到（{(time.perf_counter()-t0)*1000:.0f}ms）")
 
         # ----- 验证码输入框 -----
+        t0 = time.perf_counter()
         for pattern in get_captcha_patterns():
             el = await _query_in_scope(page, scope, pattern)
             if el:
@@ -158,7 +187,7 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
                 ):
                     continue
                 selectors["captcha"] = f"{scope} >> {pattern}" if scope else pattern
-                logger.debug(f"Captcha field found: {selectors['captcha']}")
+                _dbg(f"[detect_login_form] captcha ✅ {selectors['captcha']}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                 break
         if not selectors["captcha"]:
             for pattern in get_captcha_patterns():
@@ -167,39 +196,48 @@ async def detect_login_form(page: Page, logger) -> Dict[str, Optional[str]]:
                     if selectors["username"] and pattern == selectors["username"]:
                         continue
                     selectors["captcha"] = pattern
-                    logger.debug(f"Captcha field (page fallback): {pattern}")
+                    _dbg(f"[detect_login_form] captcha ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
+        if not selectors["captcha"]:
+            _dbg(f"[detect_login_form] captcha ✗ 未找到（{(time.perf_counter()-t0)*1000:.0f}ms）")
 
         # ----- 提交按钮 -----
+        t0 = time.perf_counter()
         for pattern in get_submit_patterns():
             el = await _query_in_scope(page, scope, pattern)
             if el:
                 selectors["submit"] = f"{scope} >> {pattern}" if scope else pattern
-                logger.debug(f"Submit button found: {selectors['submit']}")
+                _dbg(f"[detect_login_form] submit ✅ {selectors['submit']}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                 break
         if not selectors["submit"]:
             for pattern in get_submit_patterns():
                 el = await page.query_selector(pattern)
                 if el:
                     selectors["submit"] = pattern
-                    logger.debug(f"Submit button (page fallback): {pattern}")
+                    _dbg(f"[detect_login_form] submit ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
+        if not selectors["submit"]:
+            _dbg(f"[detect_login_form] submit ✗ 未找到（{(time.perf_counter()-t0)*1000:.0f}ms）")
 
         # ----- 验证码图片 -----
+        t0 = time.perf_counter()
         for pattern in get_captcha_image_patterns():
             el = await _query_in_scope(page, scope, pattern)
             if el:
                 selectors["captcha_image"] = f"{scope} >> {pattern}" if scope else pattern
-                logger.debug(f"Captcha image found: {selectors['captcha_image']}")
+                _dbg(f"[detect_login_form] captcha_image ✅ {selectors['captcha_image']}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                 break
         if not selectors["captcha_image"]:
             for pattern in get_captcha_image_patterns():
                 el = await page.query_selector(pattern)
                 if el:
                     selectors["captcha_image"] = pattern
-                    logger.debug(f"Captcha image (page fallback): {pattern}")
+                    _dbg(f"[detect_login_form] captcha_image ✅ (fallback) {pattern}（{(time.perf_counter()-t0)*1000:.0f}ms）")
                     break
+        if not selectors["captcha_image"]:
+            _dbg(f"[detect_login_form] captcha_image ✗ 未找到（{(time.perf_counter()-t0)*1000:.0f}ms）")
 
+        _dbg(f"[detect_login_form] 完成，总耗时 {(time.perf_counter()-t_total)*1000:.0f}ms，结果: {selectors}")
         return selectors
 
     except Exception as e:

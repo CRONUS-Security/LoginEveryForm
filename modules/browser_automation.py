@@ -152,9 +152,18 @@ class BrowserAutomation:
         """
         自动检测登录表单控件（规则见 modules/form_detection/ 下各文件）。
         """
+        import time as _time
         self.logger.debug("Detecting login form elements (form-scoped + autocomplete priority)...")
-        await wait_for_login_form(page, timeout_ms=5000)
-        return await detect_login_form(page, self.logger)
+        t0 = _time.perf_counter()
+        await wait_for_login_form(page, timeout_ms=5000, logger=self.logger)
+        self.logger.debug(
+            f"[detect_login_form] wait_for_login_form 完成，耗时 {(_time.perf_counter()-t0)*1000:.0f}ms"
+        )
+        result = await detect_login_form(page, self.logger)
+        self.logger.debug(
+            f"[detect_login_form] 全流程完成，总耗时 {(_time.perf_counter()-t0)*1000:.0f}ms"
+        )
+        return result
 
     async def get_captcha_image(self, page: Page, captcha_selector: Optional[str] = None) -> Optional[bytes]:
         """
